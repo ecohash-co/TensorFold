@@ -100,10 +100,12 @@ pub const Workspace = struct { xh: u64, w: u64, h: u64 };
 
 /// prefill.matmul without a bias (no DeepSeek-V4.1 linear has one): out [M, N] (row stride os elements) =
 /// x [M, K] (row stride ldx) @ W, the prompt path's arithmetic.
+/// With l.wq (TF_DS_EXL3_PROMPT=v2's cache, filled by unpack at load) the GEMM reads it instead of unpacking W_q again:
+/// the same bytes (unpack is a pure function of the trellis), one launch and 2 K N bytes of writes and reads fewer.
 pub fn matmul(k: *const Kernels, t: tri.Tri, ws: Workspace, l: weights.Linear, x: u64, x_dtype: DType, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize, m: usize) !void {
     try rotIn(k, t.stream, x, x_dtype, ldx, l.suh, ws.xh, m, l.k);
-    try unpack(k, t.stream, l, ws.w);
-    try tri_markov.matmul(t, ws.xh, ws.w, ws.h, l.svh, null, out, out_type, os, m, l.k, l.n);
+    if (l.wq == 0) try unpack(k, t.stream, l, ws.w);
+    try tri_markov.matmul(t, ws.xh, if (l.wq != 0) l.wq else ws.w, ws.h, l.svh, null, out, out_type, os, m, l.k, l.n);
 }
 
 /// prefill.Workspace.hadamard: H [128, 128] bf16, 1 - 2 * parity(i & j) (the bits of +-1.0).

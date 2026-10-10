@@ -31,6 +31,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_torch", .flags = torch_ops }, // ours: DeepSeek-V4.1 torch arithmetic at torch's rounding points
     .{ .name = "dsv41_rdma", .src = "dsv41/rdma_gather", .flags = &.{"-O3"} }, // ours: the decode gathers' RDMA kernel pair
     .{ .name = "dsv41_experts_par", .src = "dsv41/experts_par", .flags = &.{ "-O3", "-lineinfo" } }, // ours: the exl3 extension's gate / up with the parity split's rest in its grid (tensorfold_exl3_experts_v19's flags)
+    .{ .name = "dsv41_exl3_prompt", .src = "dsv41/exl3_prompt", .flags = &.{ "-O3", "-lineinfo" } }, // ours: TF_DS_EXL3_PROMPT=v2's gate / up (input rotation in the program) and down prompt GEMMs, the served arithmetic (tensorfold_exl3_experts_v19's flags)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -132,6 +133,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_rdma.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_rdma.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-rdma-bench", .root_module = ds_rdma }));
+    // TF_DS_EXL3_PROMPT=v2: a rank's prompt-chunk EXL3 GEMMs on one GPU with its real weights, today's kernels against
+    // v2's (exl3_prompt.zig), timed and compared byte for byte
+    const ds_exl3 = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/exl3_bench_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_exl3.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    ds_exl3.addImport("cuda", cuda);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-exl3-bench", .root_module = ds_exl3 }));
     // the Engram reader's buffered, O_DIRECT and AIO paths on the real tables, every byte compared
     const ds_engram = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/engram_check_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_engram.addImport("dsv41", ds_check.import_table.get("dsv41").?);

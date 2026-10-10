@@ -11,7 +11,8 @@ const checkpoint = @import("checkpoint.zig");
 /// An EXL3 linear in the strips layout: words int32 [N/128, K/16, 8, 8 * bits], fp16 suh [K] and svh [N].
 /// plan_n: the N its decode plan is made for, when not n: a 2D node's column part of a TP2 slice keeps that slice's
 /// plan (linear.py pinned plans), so its columns sum in the slice's K order.
-pub const Linear = struct { words: u64, suh: u64, svh: u64, k: u32, n: u32, k2: u32, plan_n: u32 = 0 };
+/// wq: TF_DS_EXL3_PROMPT=v2's W_q cache, fp16 [K, N] as exl3_prefill.unpack writes it (0: none, unpack per call).
+pub const Linear = struct { words: u64, suh: u64, svh: u64, k: u32, n: u32, k2: u32, plan_n: u32 = 0, wq: u64 = 0 };
 
 /// A layer's routed experts and its shared expert (the last entry), as exl3_experts.prepare lays them out. On a 2D node
 /// (exl3/experts2d.py prepare) gate / up hold its intermediate blocks (width of the half's down_k) and down its

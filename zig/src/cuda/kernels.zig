@@ -34,6 +34,7 @@ pub const dsv41_ops: []const u8 = if (available) &Blob("fatbin_dsv41_ops").bytes
 pub const dsv41_torch: []const u8 = if (available) &Blob("fatbin_dsv41_torch").bytes else &.{};
 pub const dsv41_rdma: []const u8 = if (available) &Blob("fatbin_dsv41_rdma").bytes else &.{};
 pub const dsv41_experts_par: []const u8 = if (available) &Blob("fatbin_dsv41_experts_par").bytes else &.{};
+pub const dsv41_exl3_prompt: []const u8 = if (available) &Blob("fatbin_dsv41_exl3_prompt").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {

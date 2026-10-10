@@ -23,6 +23,7 @@ const tri_markov = @import("tri_markov.zig");
 const exl3_prefill = @import("exl3_prefill.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
+const exl3_prompt = @import("exl3_prompt.zig");
 const ops = @import("ops.zig");
 const cublas = @import("cublas.zig");
 const comm = @import("comm.zig");
@@ -127,6 +128,7 @@ pub const Engine = struct {
     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
     par: ?*const exl3_experts2d.ParKernels = null, // the parity split's gate / up in one launch (null: the served two)
+    x2: ?*const exl3_prompt.Kernels = null, // TF_DS_EXL3_PROMPT=v2: a 2D node's prompt-chunk expert GEMMs (exl3_prompt.zig)
     prof: ?*pprof.Prof = null, // TF_DS_PROMPT_PROF=1: the chunk's phase marks (set by fillChunk for the chunk alone)
 
     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has

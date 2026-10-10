@@ -19,6 +19,7 @@ const prompt = @import("prompt.zig");
 const weights = @import("weights.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
+const exl3_prompt = @import("exl3_prompt.zig");
 const ring2d = @import("ring2d.zig");
 const rdma_mod = @import("rdma.zig");
 const round2d = @import("round2d.zig");
@@ -335,19 +336,28 @@ pub const Two = struct {
             defer prompt.pm(e, .moe) catch {};
             return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
         }
-        try exl3_experts2d.gateUp(e.ex, e.s, lay.experts, ch.xs, ch.x, c.hidden, ch.pick, n, c.swiglu_limit);
+        if (e.x2) |x2| {
+            // TF_DS_EXL3_PROMPT=v2: gate / up with the rotation in the program (main and rest), the same pack bytes
+            try exl3_prompt.gateUp(x2, e.ex, e.ops, e.s, lay.experts, ch.xs, if (t.ir != 0) t.rest_chunk.? else null, ch.x, c.hidden, ch.pick, n, c.swiglu_limit);
+        } else {
+            try exl3_experts2d.gateUp(e.ex, e.s, lay.experts, ch.xs, ch.x, c.hidden, ch.pick, n, c.swiglu_limit);
+            // parity: the rest columns of the experts this pair computes them for
+            if (t.ir != 0) try exl3_experts2d.gateUpRest(e.ex, e.ops, e.s, lay.experts, ch.xs, t.rest_chunk.?, ch.pick, n, c.swiglu_limit);
+        }
         if (t.ir != 0) {
-            // parity: the rest columns of the experts this pair computes them for, the packs exchanged and assembled
-            try exl3_experts2d.gateUpRest(e.ex, e.ops, e.s, lay.experts, ch.xs, t.rest_chunk.?, ch.pick, n, c.swiglu_limit);
+            // parity: the packs exchanged and assembled
             try prompt.pm(e, .moe);
             try t.assembleParity(e, lay.experts, ch.xs.xd, ch.pick, n * ch.xs.slots);
             defer prompt.pm(e, .moe) catch {};
+            if (e.x2) |x2| return exl3_prompt.down(x2, e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
             return exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
         }
         try prompt.pm(e, .moe);
         try t.catRank(e, ch.xs.xd, t.xd_full, n * ch.xs.slots, t.gu, 2);
         try prompt.pm(e, .comm);
-        try exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
+        if (e.x2) |x2| {
+            try exl3_prompt.down(x2, e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
+        } else try exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
         try prompt.pm(e, .moe);
     }
 

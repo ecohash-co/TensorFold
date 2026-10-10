@@ -21,6 +21,7 @@ const exl3_prefill = @import("exl3_prefill.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
+const exl3_prompt = @import("exl3_prompt.zig");
 const ops_mod = @import("ops.zig");
 const exact = @import("exact.zig");
 const cublas = @import("cublas.zig");
@@ -174,6 +175,7 @@ pub const Model = struct {
     ops: ops_mod.Ops,
     ex: exact.Exact,
     par: ?exl3_experts2d.ParKernels, // the parity split's one-launch gate / up (parOne)
+    x2: ?exl3_prompt.Kernels = null, // TF_DS_EXL3_PROMPT=v2 (exl3_prompt.zig), a 2D node only
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
     eng: prompt.Engine,
@@ -345,6 +347,12 @@ pub const Model = struct {
         errdefer m.ex.unload();
         m.par = if (sp.parity and parOne()) try exl3_experts2d.ParKernels.load(d, cuda.kernels.dsv41_experts_par) else null;
         errdefer if (m.par) |*x| x.unload();
+        m.x2 = null;
+        if (try exl3_prompt.enabled()) {
+            if (sp.pair == null) return error.Exl3PromptNeedsTheFourNodeSplit;
+            m.x2 = try exl3_prompt.Kernels.load(d, cuda.kernels.dsv41_exl3_prompt);
+        }
+        errdefer if (m.x2) |*x| x.unload();
 
         // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream reaches
         const half = c.rope_dim / 2;
@@ -388,6 +396,13 @@ pub const Model = struct {
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
         m.eng.round_rows = o.round_rows;
         if (m.par) |*x| m.eng.par = x;
+        if (m.x2) |*x| {
+            m.eng.x2 = x;
+            if (exl3_prompt.wqCache()) {
+                const cb = try exl3_prompt.cacheWq(d, &m.w, &m.pf, m.stream, c.layers / 2);
+                std.log.info("TF_DS_EXL3_PROMPT=v2: experts v2, W_q cache {d} MiB (layers 0-{d})", .{ cb >> 20, c.layers / 2 - 1 });
+            } else std.log.info("TF_DS_EXL3_PROMPT=v2: experts v2, no W_q cache (TF_DS_EXL3_WQ_CACHE=0)", .{});
+        }
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, m.pass_rows, m.ctx_cap); // a stream's keys at most
         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
@@ -527,6 +542,7 @@ pub const Model = struct {
         m.arena.deinit();
         m.rope_buf.free();
         if (m.par) |*x| x.unload();
+        if (m.x2) |*x| x.unload();
         m.ex.unload();
         m.ops.unload();
         m.exk.unload();

@@ -73,6 +73,12 @@ pub fn parityGU() bool {
     return std.mem.eql(u8, std.mem.span(v), "parity");
 }
 
+/// TF_RDMA_GID: the RDMA rings' source GID index (the port's RoCE v2 IPv4 entry); 5 as served on the authors' nodes.
+pub fn rdmaGid() u8 {
+    const v = std.c.getenv("TF_RDMA_GID") orelse return 5;
+    return std.fmt.parseInt(u8, std.mem.span(v), 10) catch 5;
+}
+
 /// The parity split's decode gate / up in one launch (experts_par.cu, the same bits); TF_DS_PAR_ONE=0: the served
 /// build's launches (main, then the rest's grouping and gate / up, beside it on a stream of its own with --side).
 pub fn parOne() bool {
@@ -296,7 +302,7 @@ pub const Model = struct {
                 var devices: std.ArrayList([]const u8) = .empty;
                 var dit = std.mem.splitScalar(u8, devs, ',');
                 while (dit.next()) |x| try devices.append(a, x);
-                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = 5 }, &m.comm, m.stream);
+                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid() }, &m.comm, m.stream);
                 m.two.?.rings = &m.rdma_rings.?;
             }
         }
@@ -421,7 +427,7 @@ pub const Model = struct {
     /// connected, and started once both are (an all-gather as the barrier).
     pub fn openRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, rank: u32, comm: *const comm_mod.Comm, stream: cuda.Stream) !*rdma.Ring {
         if (comm.world != 2) return error.NotTwoRanks;
-        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = 5 });
+        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid() });
         errdefer r.destroy(gpa);
         const per = @sizeOf(rdma.Info);
         const mine = [2]rdma.Info{ r.info(0), r.info(1) };

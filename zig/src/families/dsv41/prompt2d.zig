@@ -211,6 +211,7 @@ pub const Two = struct {
         const rest = ex.rest orelse return error.NoRest;
         const ig = t.gu[t.p];
         try t.packExchange(e, xd, p, ig + t.ir);
+        try prompt.pm(e, .comm);
         const part0 = if (t.p == 0) xd else t.peer;
         const part1 = if (t.p == 1) xd else t.peer;
         try e.ops.assembleRest(e.s, part0, part1, pick, rest.owner, t.xd_full, p, ig, t.ir);
@@ -277,31 +278,31 @@ pub const Two = struct {
         try e.ops.copyRows(e.s, t.parts, w[q] * esize, dst + q * w[0] * esize, row, w[q] * esize, n);
     }
 
-    /// SP rows (TF_DS_PROMPT_SP=rows): quarters for the rows this node owns. Of a chunk of n rows (a multiple of 4) node
-    /// g = r + 2 p owns rows [g q, (g + 1) q), q = n / 4. `src` [n, w[p]] (this node's columns of its TP2 rank's partial,
-    /// every row) -> `dst` [2, q, w0 + w1]: for the owned rows, rank r's partial, pair 0's columns then pair 1's, for
-    /// every r; quarters' dst rows [g q, (g + 1) q) laid out as quarters lays out a chunk of q rows. Each node sends every
-    /// other node that node's rows of its part and receives its own rows of theirs (one NCCL group of send / recv):
-    /// 3 q rows of one part in, where quarters takes 3 n; only bytes move.
-    pub fn toOwners(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {
-        if (n % 4 != 0) return error.BadOwnerRows;
+    /// SP rows (TF_DS_PROMPT_SP=rows / rows2): quarters for the rows this node owns. Of a chunk of o.n rows node
+    /// g = r + 2 p owns rows [o.r0(g), o.r0(g) + o.rows(g)) (Owners: n = 4 q under rows, node 3 the rest under rows2).
+    /// `src` [n, w[p]] (this node's columns of its TP2 rank's partial, every row) -> `dst` [2, rows, w0 + w1]: for the
+    /// owned rows, rank r's partial, pair 0's columns then pair 1's, for every r; quarters' dst rows of the owned rows
+    /// laid out as quarters lays out a chunk of that many rows. Each node sends every other node that node's rows of
+    /// its part and receives its own rows of theirs (one NCCL group of send / recv): ~3 n / 4 rows of one part in,
+    /// where quarters takes 3 n; only bytes move.
+    pub fn toOwners(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, o: Owners, w: [2]usize, esize: usize) !void {
+        if (!o.valid()) return error.BadOwnerRows;
         const me = t.r + 2 * t.p;
-        const q = n / 4;
-        if (q * @max(w[0], w[1]) * esize > t.part_bytes) return error.PartTooBig;
+        if (o.rows(3) * @max(w[0], w[1]) * esize > t.part_bytes) return error.PartTooBig;
         var sends: [3]Comm.P2p = undefined;
         var recvs: [3]Comm.P2p = undefined;
         var k: usize = 0;
         for (0..4) |h| {
             if (h == me) continue;
-            const x = ownerExchange(me, h, n, w, esize);
+            const x = ownerExchange(me, h, o, w, esize);
             sends[k] = .{ .ptr = src + x.send_off, .count = x.send_bytes, .peer = @intCast(h) };
             recvs[k] = .{ .ptr = t.parts + x.recv_off, .count = x.recv_bytes, .peer = @intCast(h) };
             k += 1;
         }
         try e.comm.sendRecv(&sends, &recvs, .u8, e.s);
-        for (ownerCopies(me, n, w, esize)) |cp| {
+        for (ownerCopies(me, o, w, esize)) |cp| {
             const base = if (cp.from == me) src else t.parts;
-            try e.ops.copyRows(e.s, base + cp.src_off, cp.src_ld, dst + cp.dst_off, cp.dst_ld, cp.bytes, q);
+            try e.ops.copyRows(e.s, base + cp.src_off, cp.src_ld, dst + cp.dst_off, cp.dst_ld, cp.bytes, o.rows(me));
         }
     }
 
@@ -318,7 +319,9 @@ pub const Two = struct {
     /// for this pair's output columns: ch.pa [n, ow[p]] fp32, the matching columns of TP2's partial.
     pub fn woB(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
         try t.catRank(e, ch.u, t.u_full, ch.n, t.uw, 2);
+        try prompt.pm(e, .comm);
         try prompt.mm(e, ch, lay.wo_b, t.u_full, t.uw[0] + t.uw[1], ch.pa, .fp32, lay.wo_b.n);
+        try prompt.pm(e, .dense);
     }
 
     /// moe_2d's experts after the routing: this node's gate / up blocks, the rank's whole intermediate assembled, down
@@ -327,16 +330,25 @@ pub const Two = struct {
     pub fn experts(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
         const c = e.c;
         const n = ch.n;
-        if (n < exl3_experts.exact_rows) return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
+        if (n < exl3_experts.exact_rows) {
+            // (decode-sized: its exchange inside, timed with the experts)
+            defer prompt.pm(e, .moe) catch {};
+            return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
+        }
         try exl3_experts2d.gateUp(e.ex, e.s, lay.experts, ch.xs, ch.x, c.hidden, ch.pick, n, c.swiglu_limit);
         if (t.ir != 0) {
             // parity: the rest columns of the experts this pair computes them for, the packs exchanged and assembled
             try exl3_experts2d.gateUpRest(e.ex, e.ops, e.s, lay.experts, ch.xs, t.rest_chunk.?, ch.pick, n, c.swiglu_limit);
+            try prompt.pm(e, .moe);
             try t.assembleParity(e, lay.experts, ch.xs.xd, ch.pick, n * ch.xs.slots);
+            defer prompt.pm(e, .moe) catch {};
             return exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
         }
+        try prompt.pm(e, .moe);
         try t.catRank(e, ch.xs.xd, t.xd_full, n * ch.xs.slots, t.gu, 2);
+        try prompt.pm(e, .comm);
         try exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
+        try prompt.pm(e, .moe);
     }
 
     /// Engram's projection summed over the TP2 ranks and cast, kv [n, ew0 + ew1] bf16 = bf16(g0 + g1) (model.py esum
@@ -351,8 +363,11 @@ pub const Two = struct {
         const their = half + mine * 2;
         const g: u32 = @intCast(t.r + 2 * t.p);
         try e.comm.exchange(src, mine, other, mine, .f32, g ^ 1, e.s);
+        try prompt.pm(e, .comm);
         try e.ops.add2Bf16(e.s, src, other, half, mine);
+        try prompt.pm(e, .engram);
         try e.comm.exchange(half, mine, their, n * w[1 - t.p], .bf16, g ^ 2, e.s);
+        try prompt.pm(e, .comm);
         const row = (w[0] + w[1]) * 2;
         for (0..2) |pg| {
             const from = if (pg == t.p) half else their;
@@ -366,15 +381,45 @@ pub const Two = struct {
     }
 };
 
-/// toOwners' transfer between owner `me` and node `h` (h != me) of a chunk of n rows: me sends h's rows of its part
-/// (row stride w[me / 2]) and receives h's part of its own rows into `parts` slot h (row stride wmax, so every slot
-/// fits the widest part). Offsets and sizes in bytes.
+/// SP rows' owners of a chunk of n rows: node h owns rows [r0(h), r0(h) + rows(h)); q rows each for nodes 0-2, node 3
+/// the rest. TF_DS_PROMPT_SP=rows: n a multiple of 64, q = n / 4 (four quarters). rows2 (of): q = 16 (n / 64), a whole
+/// number of 16-row tiles, node 3 n - 3 q (at least q, under q + 64, the same %16 class as n).
+pub const Owners = struct {
+    q: usize,
+    n: usize,
+
+    pub fn of(n: usize) Owners {
+        return .{ .q = 16 * (n / 64), .n = n };
+    }
+
+    pub fn r0(o: Owners, h: usize) usize {
+        return h * o.q;
+    }
+
+    pub fn rows(o: Owners, h: usize) usize {
+        return if (h == 3) o.n - 3 * o.q else o.q;
+    }
+
+    pub fn valid(o: Owners) bool {
+        return o.q > 0 and 3 * o.q <= o.n and o.rows(3) >= o.q;
+    }
+
+    /// Node 3's rows past 4 q (the all-gather of equal parts misses them): [first, count].
+    pub fn tail(o: Owners) [2]usize {
+        return .{ 4 * o.q, o.n - @min(o.n, 4 * o.q) };
+    }
+};
+
+/// toOwners' transfer between owner `me` and node `h` (h != me) of a chunk's rows: me sends h's rows of its part
+/// (row stride w[me / 2]) and receives h's part of its own rows into `parts` slot h (slots of node 3's rows at row
+/// stride wmax, so every slot fits the most rows of the widest part). Offsets and sizes in bytes. Four quarters
+/// (n = 4 q): slot h at h q rows, as before.
 pub const OwnerXfer = struct { send_off: usize, send_bytes: usize, recv_off: usize, recv_bytes: usize };
 
-pub fn ownerExchange(me: usize, h: usize, n: usize, w: [2]usize, esize: usize) OwnerXfer {
-    const q = n / 4;
+pub fn ownerExchange(me: usize, h: usize, o: Owners, w: [2]usize, esize: usize) OwnerXfer {
     const wmax = @max(w[0], w[1]);
-    return .{ .send_off = h * q * w[me / 2] * esize, .send_bytes = q * w[me / 2] * esize, .recv_off = h * q * wmax * esize, .recv_bytes = q * w[h / 2] * esize };
+    const slot = o.rows(3);
+    return .{ .send_off = o.r0(h) * w[me / 2] * esize, .send_bytes = o.rows(h) * w[me / 2] * esize, .recv_off = h * slot * wmax * esize, .recv_bytes = o.rows(me) * w[h / 2] * esize };
 }
 
 /// One of toOwners' copies into dst [2, q, w0 + w1]: q rows of `bytes` from node `from`'s part of the owned rows (the
@@ -382,8 +427,8 @@ pub fn ownerExchange(me: usize, h: usize, n: usize, w: [2]usize, esize: usize) O
 /// partial at pair from / 2's columns (quarters' placement of node `from`).
 pub const OwnerCopy = struct { from: usize, src_off: usize, src_ld: usize, dst_off: usize, dst_ld: usize, bytes: usize };
 
-pub fn ownerCopies(me: usize, n: usize, w: [2]usize, esize: usize) [4]OwnerCopy {
-    const q = n / 4;
+pub fn ownerCopies(me: usize, o: Owners, w: [2]usize, esize: usize) [4]OwnerCopy {
+    const q = o.rows(me);
     const row = (w[0] + w[1]) * esize;
     var out: [4]OwnerCopy = undefined;
     for (0..4) |h| {
@@ -391,7 +436,7 @@ pub fn ownerCopies(me: usize, n: usize, w: [2]usize, esize: usize) [4]OwnerCopy 
         const ph = h / 2;
         out[h] = .{
             .from = h,
-            .src_off = if (h == me) me * q * w[ph] * esize else ownerExchange(me, h, n, w, esize).recv_off,
+            .src_off = if (h == me) o.r0(me) * w[ph] * esize else ownerExchange(me, h, o, w, esize).recv_off,
             .src_ld = w[ph] * esize,
             .dst_off = rh * q * row + ph * w[0] * esize,
             .dst_ld = row,
@@ -401,46 +446,80 @@ pub fn ownerCopies(me: usize, n: usize, w: [2]usize, esize: usize) [4]OwnerCopy 
     return out;
 }
 
-test "toOwners: every owner's rows of quarters' [2, n, D], from the bytes the four nodes send" {
-    // four nodes' parts of two TP2 ranks' partials, uneven pair widths, as bytes (esize 4)
-    const n: usize = 8;
-    const q: usize = n / 4;
-    const w = [2]usize{ 5, 3 };
-    const es: usize = 4;
-    const dw: usize = w[0] + w[1];
-    const wmax: usize = @max(w[0], w[1]);
-    // partial[r][row][col]: a distinct u32 per entry
-    var partial: [2][n][dw]u32 = undefined;
-    for (0..2) |r| for (0..n) |i| for (0..dw) |j| {
-        partial[r][i][j] = @intCast(r * 1000000 + i * 1000 + j);
-    };
-    // node g's part: rank g % 2's partial at pair g / 2's columns, every row
-    var parts: [4][n * wmax]u32 = undefined;
-    for (0..4) |g| for (0..n) |i| for (0..w[g / 2]) |j| {
-        parts[g][i * w[g / 2] + j] = partial[g % 2][i][(g / 2) * w[0] + j];
-    };
-    // quarters' dst [2, n, D] is partial itself; each owner's toOwners dst must be its rows of it
-    for (0..4) |me| {
-        var staged: [4 * q * wmax]u32 = @splat(0);
-        const staged_b = std.mem.sliceAsBytes(&staged);
-        for (0..4) |h| {
-            if (h == me) continue;
-            // h's send to me (its view of the same exchange) lands where me's receive from h says
-            const sx = ownerExchange(h, me, n, w, es);
-            const rx = ownerExchange(me, h, n, w, es);
-            try std.testing.expectEqual(sx.send_bytes, rx.recv_bytes);
-            const src_b = std.mem.sliceAsBytes(&parts[h]);
-            @memcpy(staged_b[rx.recv_off..][0..rx.recv_bytes], src_b[sx.send_off..][0..sx.send_bytes]);
-        }
-        var dst: [2 * q * dw]u32 = @splat(0xffffffff);
-        const dst_b = std.mem.sliceAsBytes(&dst);
-        for (ownerCopies(me, n, w, es)) |cp| {
-            const base = if (cp.from == me) std.mem.sliceAsBytes(&parts[me]) else staged_b;
-            for (0..q) |i| @memcpy(dst_b[cp.dst_off + i * cp.dst_ld ..][0..cp.bytes], base[cp.src_off + i * cp.src_ld ..][0..cp.bytes]);
-        }
-        for (0..2) |r| for (0..q) |i| for (0..dw) |j| {
-            try std.testing.expectEqual(partial[r][me * q + i][j], dst[(r * q + i) * dw + j]);
+test "toOwners: every owner's rows of quarters' [2, n, D], from the bytes the four nodes send (even and rows2's split)" {
+    // four nodes' parts of two TP2 ranks' partials, uneven pair widths, as bytes (esize 4); four quarters (rows) and
+    // node 3 taking the rest (rows2)
+    inline for (.{ Owners{ .q = 2, .n = 8 }, Owners{ .q = 2, .n = 11 }, Owners{ .q = 3, .n = 12 } }) |o| {
+        const n: usize = o.n;
+        const w = [2]usize{ 5, 3 };
+        const es: usize = 4;
+        const dw: usize = w[0] + w[1];
+        const wmax: usize = @max(w[0], w[1]);
+        try std.testing.expect(o.valid());
+        // partial[r][row][col]: a distinct u32 per entry
+        var partial: [2][n][dw]u32 = undefined;
+        for (0..2) |r| for (0..n) |i| for (0..dw) |j| {
+            partial[r][i][j] = @intCast(r * 1000000 + i * 1000 + j);
         };
+        // node g's part: rank g % 2's partial at pair g / 2's columns, every row
+        var parts: [4][n * wmax]u32 = undefined;
+        for (0..4) |g| for (0..n) |i| for (0..w[g / 2]) |j| {
+            parts[g][i * w[g / 2] + j] = partial[g % 2][i][(g / 2) * w[0] + j];
+        };
+        // the owners' rows cover the chunk once, in order
+        var covered: usize = 0;
+        for (0..4) |h| {
+            try std.testing.expectEqual(covered, o.r0(h));
+            covered += o.rows(h);
+        }
+        try std.testing.expectEqual(n, covered);
+        // quarters' dst [2, n, D] is partial itself; each owner's toOwners dst must be its rows of it
+        for (0..4) |me| {
+            const rm = o.rows(me);
+            var staged: [4 * n * wmax]u32 = @splat(0);
+            const staged_b = std.mem.sliceAsBytes(&staged);
+            for (0..4) |h| {
+                if (h == me) continue;
+                // h's send to me (its view of the same exchange) lands where me's receive from h says
+                const sx = ownerExchange(h, me, o, w, es);
+                const rx = ownerExchange(me, h, o, w, es);
+                try std.testing.expectEqual(sx.send_bytes, rx.recv_bytes);
+                // the slots never overlap and fit node 3's rows at the widest part
+                try std.testing.expect(rx.recv_off + rx.recv_bytes <= (h + 1) * o.rows(3) * wmax * es);
+                const src_b = std.mem.sliceAsBytes(&parts[h]);
+                @memcpy(staged_b[rx.recv_off..][0..rx.recv_bytes], src_b[sx.send_off..][0..sx.send_bytes]);
+            }
+            var dst: [2 * n * dw]u32 = @splat(0xffffffff);
+            const dst_b = std.mem.sliceAsBytes(&dst);
+            for (ownerCopies(me, o, w, es)) |cp| {
+                const base = if (cp.from == me) std.mem.sliceAsBytes(&parts[me]) else staged_b;
+                for (0..rm) |i| @memcpy(dst_b[cp.dst_off + i * cp.dst_ld ..][0..cp.bytes], base[cp.src_off + i * cp.src_ld ..][0..cp.bytes]);
+            }
+            for (0..2) |r| for (0..rm) |i| for (0..dw) |j| {
+                try std.testing.expectEqual(partial[r][o.r0(me) + i][j], dst[(r * rm + i) * dw + j]);
+            };
+        }
+    }
+}
+
+test "rows2's owners: whole 16-row tiles for nodes 0-2, node 3 the rest in n's %16 class; four quarters when n % 64 == 0" {
+    for ([_]usize{ 256, 2048, 4096 }) |n| {
+        const o = Owners.of(n);
+        try std.testing.expectEqual(n / 4, o.q);
+        try std.testing.expectEqual(n / 4, o.rows(3));
+        try std.testing.expectEqual([2]usize{ n, 0 }, o.tail());
+    }
+    var n: usize = 256;
+    while (n <= 4096) : (n += 1) {
+        const o = Owners.of(n);
+        try std.testing.expect(o.valid());
+        try std.testing.expect(o.q % 16 == 0 and o.q >= 64);
+        try std.testing.expect(o.rows(3) >= o.q and o.rows(3) < o.q + 64);
+        try std.testing.expectEqual(n % 16, o.rows(3) % 16); // the class of today's replicated launch on n rows
+        try std.testing.expect(o.r0(3) % 16 == 0);
+        const t = o.tail();
+        try std.testing.expectEqual(n, t[0] + t[1]);
+        try std.testing.expect(t[1] < 64);
     }
 }
 

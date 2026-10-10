@@ -27,6 +27,11 @@
 //!                                               (model.passRows; unset: one chunk a pass, as served)
 //!   TF_DS_PROMPT_SP=rows                        world 4: SP rows on encoder-only chunks (prompt.spFits) and catRank
 //!                                               by send / recv with the column partner
+//!   TF_DS_PROMPT_SP=rows2                       rows, and also the chunk reaching the replay (its encoder layers; its
+//!                                               rows past the replay whole again at the cut) and any n >= 256
+//!                                               (prompt.spFits2, prompt2d.Owners)
+//!   TF_DS_PROMPT_PROF=1                         each prompt chunk's GPU time by phase, a JSON line a chunk on stderr
+//!                                               (pprof.zig; one synchronize a chunk)
 //!   TF_DS_PROMPT_OVERLAP=1                      world 4 with TF_DS_PROMPT_CHUNK=4096: a pass's two chunks one layer
 //!                                               apart on two streams and NCCL communicators (model.Overlap)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context

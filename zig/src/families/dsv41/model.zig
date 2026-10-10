@@ -28,6 +28,7 @@ const comm_mod = @import("comm.zig");
 const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
+const pprof_mod = @import("pprof.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -45,9 +46,18 @@ pub fn promptChunk() !usize {
 
 /// TF_DS_PROMPT_SP=rows: SP rows on the four-node split's encoder-only prompt chunks (prompt.spFits): each node mixes
 /// its quarter of the rows, the partials go to the rows' owners and x is all-gathered; catRank by send / recv.
+/// TF_DS_PROMPT_SP=rows2: the same, and also the chunk that reaches the replay and any row count (prompt.spFits2).
+pub fn spMode() prompt.SpMode {
+    const v = std.c.getenv("TF_DS_PROMPT_SP") orelse return .off;
+    const x = std.mem.span(v);
+    if (std.mem.eql(u8, x, "rows")) return .rows;
+    if (std.mem.eql(u8, x, "rows2")) return .rows2;
+    return .off;
+}
+
+/// Whether TF_DS_PROMPT_SP asks for SP rows (rows or rows2).
 pub fn spRows() bool {
-    const v = std.c.getenv("TF_DS_PROMPT_SP") orelse return false;
-    return std.mem.eql(u8, std.mem.span(v), "rows");
+    return spMode() != .off;
 }
 
 /// TF_DS_PROMPT_OVERLAP=1 (four-node split, with TF_DS_PROMPT_CHUNK=4096): an encoder-only pass's two chunks run one
@@ -215,6 +225,8 @@ pub const Model = struct {
     pass_rows: usize = chunk_rows, // a prompt pass's rows at most (promptChunk)
     ov: ?*Overlap = null, // the overlapped passes' second chunk (promptOverlap)
     sp_rows: bool = false, // SP rows on encoder-only chunks (spRows; world 4)
+    sp_mode: prompt.SpMode = .off, // which chunks take them (spMode)
+    pprof: ?*pprof_mod.Prof = null, // TF_DS_PROMPT_PROF=1: the prompt chunks' GPU time by phase
     rdma_rings: ?ring2d.Rings = null,
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
@@ -269,6 +281,8 @@ pub const Model = struct {
         m.pass_rows = try promptChunk();
         m.ov = null;
         m.sp_rows = spRows();
+        m.sp_mode = spMode();
+        m.pprof = null;
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
@@ -460,6 +474,13 @@ pub const Model = struct {
         m.ids64 = try a.alloc(i64, m.pass_rows);
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
+        if (pprof_mod.wanted()) {
+            // TF_DS_PROMPT_PROF=1: timing events for the prompt chunks' phases (nothing else changes)
+            const p = try gpa.create(pprof_mod.Prof);
+            errdefer gpa.destroy(p);
+            p.* = try pprof_mod.Prof.init(gpa, d, o.rank);
+            m.pprof = p;
+        }
         return m;
     }
 
@@ -477,6 +498,12 @@ pub const Model = struct {
         if (m.ptimer) |t| {
             t.deinit();
             m.gpa.destroy(t);
+        }
+        if (m.pprof) |p| {
+            p.summary();
+            p.deinit();
+            m.gpa.destroy(p);
+            m.pprof = null;
         }
         if (m.ov) |ov| {
             ov.stream.synchronize() catch {};
@@ -700,14 +727,21 @@ pub const Model = struct {
         var shared: prompt.Shared = .{};
         const pt = m.ptimer;
         if (pt) |t| try t.mark(m.stream, .start);
+        // TF_DS_PROMPT_PROF=1: this chunk's phase marks (the engine carries them for the chunk alone)
+        const pp = m.pprof;
+        if (pp) |p| {
+            try p.begin(m.stream, start, n, replay);
+            m.eng.prof = p;
+        }
+        defer m.eng.prof = null;
         try prompt.begin(e, ch, m.ids64[0..n], start, m.host_pos);
         ch.sub_rows = if (n > chunk_rows) chunk_rows else 0;
         ch.sp = null;
-        if (m.sp_rows) if (m.two) |t| if (prompt.spFits(n, start, replay, ch.spans.len)) {
-            ch.sp = .{ .g = t.r + 2 * t.p, .q = n / 4 };
-        };
+        if (m.two) |t| ch.sp = prompt.spFor(m.sp_mode, t.r + 2 * t.p, n, start, replay, ch.spans.len);
+        if (pp) |p| p.sp = if (ch.sp) |x| (if (x.cut) "rows2-cut" else if (x.n == 4 * x.q) "rows" else "rows2") else "off";
         if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
         if (pt) |t| try t.mark(m.stream, .embed);
+        try prompt.pm(e, .other);
         const taps = m.dr != null;
         var floor: usize = 0;
         var kv_done: ?usize = null;
@@ -734,11 +768,12 @@ pub const Model = struct {
             if (li == c.layers / 2) {
                 if (!try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos)) {
                     // encoder-only: no synchronize either (as at the chunk's end below), so the next chunk's host steps
-                    // run while this one's last layers do; the profile alone waits
+                    // run while this one's last layers do; the profiles alone wait
                     if (pt) |t| {
                         try m.stream.synchronize();
                         try t.finish();
                     }
+                    if (pp) |p| try p.finish();
                     return false;
                 }
                 floor = replay;
@@ -750,6 +785,7 @@ pub const Model = struct {
                     th.join();
                     ahead = null;
                 }
+                try prompt.pm(e, .host); // (the GPU's wait for the read-ahead, if it was behind)
                 if (eh.ahead_err) |err| return err;
                 try prompt.engramApply(e, ch, eh, li, seq);
                 const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
@@ -790,7 +826,9 @@ pub const Model = struct {
             // its taps (the tap layers side by side) into the slot's drafter rings
             const dw = c.hidden;
             for (0..c.dspark_taps.slice().len) |j| try e.ops.copyRows(e.s, prompt.tapRows(e, ch, j), dw * 2, dr.at + j * dw * 2, dr.taps_w * 2, dw * 2, ch.n);
+            m.eng.prof = null; // (the absorb's launches as one stretch: `other`)
             try dr.absorb(e, ch, &m.dpool.?, m.fill_slot, dr.at, ch.n, ch.start);
+            if (pp) |p| try p.mark(m.stream, .other);
         }
         // no synchronize: the next chunk's host steps (its first Engram layer's hashing, table reads and decode, ~0.14 s
         // at 2,048 rows) run while this chunk's kernels do; readers of the results (the prompt's logits) synchronize.
@@ -798,6 +836,10 @@ pub const Model = struct {
         if (pt) |t| {
             try m.stream.synchronize();
             try t.finish();
+        }
+        if (pp) |p| {
+            try p.finish();
+            p.summary(); // (a prompt's last chunk: the rank's sums so far, in case the process never reaches close)
         }
         return true;
     }
@@ -836,9 +878,7 @@ pub const Model = struct {
         for ([_]*prompt.Chunk{ cha, chb }, [_]usize{ start, start + half }) |ch, s0| {
             ch.sub_rows = 0;
             ch.sp = null;
-            if (m.sp_rows) if (m.two) |t| if (prompt.spFits(half, s0, replay, 0)) {
-                ch.sp = .{ .g = t.r + 2 * t.p, .q = half / 4 };
-            };
+            if (m.two) |t| ch.sp = prompt.spFor(m.sp_mode, t.r + 2 * t.p, half, s0, replay, 0);
         }
         var sha: prompt.Shared = .{};
         var shb: prompt.Shared = .{};

@@ -34,6 +34,7 @@ const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const prompt2d = @import("prompt2d.zig");
 const rdma = @import("rdma.zig");
+const pprof = @import("pprof.zig");
 
 /// The indexer's [rows, n_comp] keys a row block holds at most (model.py: rb * n_comp <= 2^26 / 4 past 16 rows).
 const key_elems: usize = 1 << 24;
@@ -126,6 +127,7 @@ pub const Engine = struct {
     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
     par: ?*const exl3_experts2d.ParKernels = null, // the parity split's gate / up in one launch (null: the served two)
+    prof: ?*pprof.Prof = null, // TF_DS_PROMPT_PROF=1: the chunk's phase marks (set by fillChunk for the chunk alone)
 
     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.
@@ -160,14 +162,30 @@ fn overlap(sp: Span, start: usize, n: usize) ?[2]usize {
     return if (lo < hi) .{ lo - start, hi - start } else null;
 }
 
-/// SP rows of a chunk: node g of the four owns rows [g q, (g + 1) q) (n = 4 q, q a multiple of 16).
-pub const Sp = struct { g: usize, q: usize };
+/// SP rows of a chunk of n rows, node g's view: node h of the four owns rows [h q, h q + rows(h)) (prompt2d.Owners: q =
+/// 16 (n / 64) for nodes 0-2, node 3 the rest; n a multiple of 64 gives four quarters, n = 4 q, as TF_DS_PROMPT_SP=rows
+/// takes them). cut: the chunk reaches the replay (TF_DS_PROMPT_SP=rows2): at the decoder's first layer its rows from
+/// the replay on come back whole to every node (spCutRows) and the chunk goes on replicated, as today.
+pub const Sp = struct {
+    g: usize,
+    q: usize,
+    n: usize,
+    cut: bool = false,
 
-/// The rows a node's mixes run on: every row, or with SP rows its own quarter.
+    pub fn of(g: usize, n: usize, cut: bool) Sp {
+        return .{ .g = g, .q = prompt2d.Owners.of(n).q, .n = n, .cut = cut };
+    }
+
+    pub fn owners(sp: Sp) prompt2d.Owners {
+        return .{ .q = sp.q, .n = sp.n };
+    }
+};
+
+/// The rows a node's mixes run on: every row, or with SP rows its own.
 pub const MixRows = struct { r0: usize, rows: usize };
 
 pub fn mixRows(ch: *const Chunk) MixRows {
-    if (ch.sp) |sp| return .{ .r0 = sp.g * sp.q, .rows = sp.q };
+    if (ch.sp) |sp| return .{ .r0 = sp.owners().r0(sp.g), .rows = sp.owners().rows(sp.g) };
     return .{ .r0 = 0, .rows = ch.n };
 }
 
@@ -177,6 +195,31 @@ pub fn mixRows(ch: *const Chunk) MixRows {
 /// before the replay: no decoder row, no head, so the streams never need to be whole again).
 pub fn spFits(n: usize, start: usize, replay: usize, spans: usize) bool {
     return spans == 0 and n % 64 == 0 and n >= 256 and start + n <= replay;
+}
+
+/// TF_DS_PROMPT_SP=rows2: SP rows also on a chunk that reaches the replay (its encoder layers; the rows from the replay
+/// on come back whole at the cut and the decoder layers run replicated) and on any n of at least 256 rows (Sp.of:
+/// nodes 0-2 whole 16-row tiles, node 3 the rest, the same %16 class as n). A chunk with no row before the replay (a
+/// decoder chunk) and image spans stay replicated.
+pub fn spFits2(n: usize, start: usize, replay: usize, spans: usize) bool {
+    return spans == 0 and n >= 256 and start < replay;
+}
+
+/// Which SP rows a chunk takes on node g: TF_DS_PROMPT_SP=rows (spFits) or rows2 (spFits2), null: none.
+pub fn spFor(mode: SpMode, g: usize, n: usize, start: usize, replay: usize, spans: usize) ?Sp {
+    switch (mode) {
+        .off => return null,
+        .rows => return if (spFits(n, start, replay, spans)) Sp.of(g, n, false) else null,
+        .rows2 => return if (spFits2(n, start, replay, spans)) Sp.of(g, n, start + n > replay) else null,
+    }
+}
+
+/// TF_DS_PROMPT_SP: off (unset), rows, rows2.
+pub const SpMode = enum { off, rows, rows2 };
+
+/// The phase marks of TF_DS_PROMPT_PROF=1 (pprof.zig): the end of a stretch of `ph`'s launches; nothing when unset.
+pub fn pm(e: *const Engine, ph: pprof.Phase) !void {
+    if (e.prof) |p| try p.mark(e.s, ph);
 }
 
 pub const Chunk = struct {
@@ -725,6 +768,7 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     } else {
         try tri_basic.hcPre(e.t, v.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], v.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, v.x, v.pre_a, v.post, v.comb, ch.part, v.rows, c.hidden);
     }
+    try pm(e, .mix);
     try spGatherX(e, ch);
 }
 
@@ -758,6 +802,87 @@ fn spGatherX(e: *const Engine, ch: *const Chunk) !void {
     const sp = ch.sp orelse return;
     const d = e.c.hidden;
     try e.comm.allGather(ch.x + sp.g * sp.q * d * 2, ch.x, sp.q * d, .bf16, e.s);
+    // rows2's uneven split: node 3's rows past 4 q (under 64) to the other three, by send / recv (bytes)
+    try spTail(e, sp, ch.x, d * 2);
+    try pm(e, .comm);
+}
+
+/// rows [4 q, n) of `buf` (rows of `row` bytes; node 3's past the all-gather's equal parts) from node 3 to the other
+/// three, in place; nothing when the split is even.
+fn spTail(e: *const Engine, sp: Sp, buf: u64, row: usize) !void {
+    const o = sp.owners();
+    const t = o.tail();
+    if (t[1] == 0) return;
+    const at = buf + t[0] * row;
+    const bytes = t[1] * row;
+    var xs: [3]comm.Comm.P2p = undefined;
+    var k: usize = 0;
+    if (sp.g == 3) {
+        for (0..3) |h| {
+            xs[k] = .{ .ptr = at, .count = bytes, .peer = @intCast(h) };
+            k += 1;
+        }
+        return e.comm.sendRecv(xs[0..k], &.{}, .u8, e.s);
+    }
+    xs[0] = .{ .ptr = at, .count = bytes, .peer = 3 };
+    return e.comm.sendRecv(&.{}, xs[0..1], .u8, e.s);
+}
+
+/// rows2 at the replay cut: rows [first, n) of the streams h and of pre (the decoder layers' inputs; each node holds
+/// its own rows of them after the cut layer's mixes) from their owners to every node, one NCCL group of send / recv
+/// (cutPlan; bytes only). After it every node holds those rows as a replicated chunk's mixes leave them.
+fn spCutRows(e: *const Engine, ch: *const Chunk, sp: Sp, first: usize) !void {
+    const c = e.c;
+    const hrow = c.hc * c.hidden * 2;
+    const prow = c.hc * 4;
+    var plan: [6]CutXfer = undefined;
+    const k = cutPlan(sp.owners(), sp.g, first, &plan);
+    var sends: [6]comm.Comm.P2p = undefined;
+    var recvs: [6]comm.Comm.P2p = undefined;
+    var ns: usize = 0;
+    var nr: usize = 0;
+    for (plan[0..k]) |x| {
+        // per peer: the streams' rows, then pre's (the receiver posts them in the same order)
+        const two = [2]comm.Comm.P2p{
+            .{ .ptr = ch.h + x.row * hrow, .count = x.rows * hrow, .peer = @intCast(x.peer) },
+            .{ .ptr = ch.pre + x.row * prow, .count = x.rows * prow, .peer = @intCast(x.peer) },
+        };
+        if (x.send) {
+            sends[ns] = two[0];
+            sends[ns + 1] = two[1];
+            ns += 2;
+        } else {
+            recvs[nr] = two[0];
+            recvs[nr + 1] = two[1];
+            nr += 2;
+        }
+    }
+    if (ns + nr > 0) try e.comm.sendRecv(sends[0..ns], recvs[0..nr], .u8, e.s);
+}
+
+/// One transfer of the cut: `rows` rows from row `row`, to (send) or from (receive) node `peer`.
+pub const CutXfer = struct { peer: usize, row: usize, rows: usize, send: bool };
+
+/// Node me's transfers at the cut of rows [first, n): owner by owner, the owner's rows there; me sends its own to each
+/// other node (in node order) and receives each other owner's from it. Returns how many.
+pub fn cutPlan(o: prompt2d.Owners, me: usize, first: usize, out: *[6]CutXfer) usize {
+    var k: usize = 0;
+    for (0..4) |h| {
+        const lo = @max(first, o.r0(h));
+        const hi = o.r0(h) + o.rows(h);
+        if (lo >= hi) continue;
+        if (h == me) {
+            for (0..4) |p| {
+                if (p == me) continue;
+                out[k] = .{ .peer = p, .row = lo, .rows = hi - lo, .send = true };
+                k += 1;
+            }
+        } else {
+            out[k] = .{ .peer = h, .row = lo, .rows = hi - lo, .send = false };
+            k += 1;
+        }
+    }
+    return k;
 }
 
 /// mm(layer, x, out_dtype) of m rows: the prompt GEMM beyond 128 rows, the layer's own group (GROUPED) up to 128.
@@ -798,8 +923,11 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     } else {
         try grouped(e, ch, n, &.{ lay.wq_a, lay.wkv }, &.{ ch.x, ch.x }, &.{ c.hidden, c.hidden }, &.{ ch.qa, ch.y }, &.{ lay.wq_a.n, hd }, &.{ .bf16, .bf16 });
     }
+    try pm(e, .dense);
     try tri_basic.rmsnorm(e.t, ch.qa, lay.wq_a.n, lay.q_norm, ch.qr, lay.wq_a.n, c.eps, n, lay.wq_a.n);
+    try pm(e, .mix);
     try mm(e, ch, lay.wq_b, ch.qr, lay.wq_a.n, ch.q, .bf16, hl * hd);
+    try pm(e, .dense);
     try tri_norm.ropeHeads(e.t, ch.q, rope.cos, rope.sin, ch.pos, rd, false, n, hl, hd);
     // the window keys: the ring's last window - 1 positions before start, then this chunk's rows
     const lo = @max(floor, start -| (c.window - 1));
@@ -824,6 +952,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     const kv = ch.wsrc + (start - lo) * hd * 2;
     // slots -1: the keys go to wsrc only (ring_mode is off); the ring is written after the attention
     if (!ring_mode) try tri_norm.kvNormRope(e.t, ch.y, lay.kv_norm, rope.cos, rope.sin, ch.pos, ring, ring_rows, ch.neg, c.eps, true, rd, kv, n, hd);
+    try pm(e, .attn);
     var comp: tri_attn.Comp = .none;
     var n_idx: usize = 0;
     var padded = false;
@@ -848,6 +977,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
             try e.ops.copyRows(e.s, ch.cidx, kk * 8, ch.cidxp, kp * 8, kk * 8, n);
             padded = true;
         }
+        try pm(e, .attn);
     }
     try tri_attn.sparseAttn(e.t, .{
         .q = ch.q,
@@ -877,6 +1007,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         try upload(e, ch.ring_idx, &idx, keep * 8);
         try e.ops.scatterRows(e.s, kv + (n - keep) * hd * 2, hd * 2, ch.ring_idx, ring, hd * 2, hd * 2, keep);
     }
+    try pm(e, .attn);
     // wo_a: each group's column block of o read in place, written into its column block of u; then wo_b to fp32
     const groups = lay.groups;
     const gk = hl * hd / groups;
@@ -901,8 +1032,10 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         const dts = [_]exl3_linear.DType{ .bf16, .bf16, .bf16, .bf16 };
         try grouped(e, ch, n, lay.wo_a[0..groups], xs[0..groups], lds[0..groups], outs[0..groups], oss[0..groups], dts[0..groups]);
     }
+    try pm(e, .dense);
     if (e.two) |t| return t.woB(e, ch, lay); // 2D: the column partner's groups first, then this pair's columns
     try mm(e, ch, lay.wo_b, ch.u, uw, ch.pa, .fp32, c.hidden);
+    try pm(e, .dense);
 }
 
 /// kv_source_update of a kv-source layer on the chunk (no earlier pending row: a chunk starting on a group boundary):
@@ -922,11 +1055,13 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
     const full = n / r;
     if (r == 1) {
         try mm(e, ch, cwkv, ch.x, c.hidden, ch.lat2, .bf16, hd);
+        try pm(e, .dense);
         try e.exact.rmsNorm(e.s, ch.lat2, hd, lay.comp_norm, ch.lat, hd, n, hd, c.eps);
     } else {
         if (r != 2) return notPorted(@src());
         try mm(e, ch, cwkv, ch.x, c.hidden, ch.kvc, .fp32, hd);
         try mm(e, ch, lay.comp_wgate.?, ch.x, c.hidden, ch.scc, .fp32, hd);
+        try pm(e, .dense);
         // rk[pw] = kv[-keep:], rs[pw] = score[-keep:]: pw = positions start + n - keep .. % RAW
         const keep: usize = @min(n, raw_rows);
         var idx: [raw_rows]i64 = undefined;
@@ -936,6 +1071,7 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
         try e.ops.scatterRows(e.s, ch.scc + (n - keep) * hd * 4, hd * 4, ch.raw_idx, cs.raw_score[li], hd * 4, hd * 4, keep);
         if (full == 0) { // a one-row chunk (a prompt one past a chunk end): its row waits in the store, no new group
             sh.kv_layer = li;
+            try pm(e, .attn);
             return;
         }
         try e.exact.compress2(e.s, ch.kvc, ch.scc, ch.lat2, full, hd);
@@ -953,9 +1089,11 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
     try upload(e, ch.groups, &g_host, full * 8);
     try upload(e, ch.gpos, &p_host, full * 8);
     const rot = e.compressed;
+    try pm(e, .attn);
     if (lay.idx_wk) |iwk| {
         const id = c.index_head_dim;
         try mmRows(e, ch, full, iwk, ch.lat, hd, ch.lat2, .bf16, id);
+        try pm(e, .dense);
         try e.exact.rmsNorm(e.s, ch.lat2, id, lay.idx_k_norm, ch.ik, id, full, id, c.eps);
         try e.exact.rope(e.s, ch.ik, id, id - rd, rot.cos, rot.sin, ch.gpos, full, rd / 2, false);
         // switch "comp": the packed cache's rows in one launch (fp4_store: store_rows' bytes)
@@ -964,6 +1102,7 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
     try e.ops.copyRows(e.s, ch.lat, hd * 2, ch.lat2, hd * 2, hd * 2, full);
     try e.exact.rope(e.s, ch.lat2, hd, hd - rd, rot.cos, rot.sin, ch.gpos, full, rd / 2, false);
     try tri_attn.fp4Store(e.t, ch.lat2, hd, cs.comp_codes[li], cs.comp_scales[li], ch.groups, full, hd, 16, true);
+    try pm(e, .attn);
 }
 
 /// The indexer of a layer with index queries (switch "prompt_keys", layers before the candidate source): the
@@ -982,9 +1121,11 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     }
     if (n_comp_end > ch.max_comp) return error.ChunkTooLong;
     try mm(e, ch, wqb, ch.qr, lay.wq_a.n, ch.iq, .bf16, ih * id);
+    try pm(e, .dense);
     try tri_norm.ropeHeads(e.t, ch.iq, rope.cos, rope.sin, ch.pos, c.rope_dim, false, n, ih, id);
     // switch "idx": fp4_qd's bytes in one launch
     try tri_attn.fp4QdP2(e.t, ch.iq, ch.iq4, n * ih * id);
+    try pm(e, .attn);
     if (n <= tri.decode_rows) {
         // a decode-sized chunk: the row-invariant matmul of the fp16 projection (rowmm2)
         try tri_norm.rowmm2(e.t, ch.x, c.hidden, lay.idx_proj_h, ch.wl, n, c.hidden, ih);
@@ -993,6 +1134,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         try xwTRows(e, ch, ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih);
     }
     try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
+    try pm(e, .dense);
     // a pass of two chunks (ch.sub_rows): each chunk's rows selected as that chunk selects them alone (its n_comp_end:
     // the keys it scores, kk, its row blocks and the pool), so every row's selection is the launches of 2,048-row chunks
     const sub = if (ch.sub_rows != 0) ch.sub_rows else n;
@@ -1007,6 +1149,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         kk_pass = kk;
     }
     sh.kk = kk_pass.?;
+    try pm(e, .attn);
 }
 
 /// The indexer's selection for the chunk's rows [s0, s0 + n) scoring n_comp_end keys (the whole chunk: s0 0, n its rows):
@@ -1109,9 +1252,10 @@ pub fn scale(hd: usize) f32 {
 
 /// Comm.gather: [world, n, D] fp32 of every rank's partial, in rank order.
 pub fn gather(e: *const Engine, ch: *const Chunk, src: u64, dst: u64) !void {
+    defer pm(e, .comm) catch {};
     if (e.two) |t| {
-        // SP rows: [2, q, D] of the rows this node owns (its mixes post only those)
-        if (ch.sp != null) return t.toOwners(e, src, dst, ch.n, t.ow, 4);
+        // SP rows: [2, rows, D] of the rows this node owns (its mixes post only those)
+        if (ch.sp) |sp| return t.toOwners(e, src, dst, sp.owners(), t.ow, 4);
         return t.quarters(e, src, dst, ch.n, t.ow, 4); // 2D: the same [2, n, D] from the four quarters
     }
     try e.comm.allGather(src, dst, ch.n * e.c.hidden, .f32, e.s);
@@ -1125,6 +1269,7 @@ pub fn ffnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     const v = mixView(e, ch);
     const src = try tri_hc.hcPrePf(e.t, v.h, lay.hc_ffn[0], lay.hc_ffn[1], lay.hc_ffn[2], v.pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, v.x, v.pre_f, v.post, v.comb, ch.part, .{ .gathered = ch.ga, .world = e.world, .h_out = v.h_alt }, v.rows, c.hidden);
     swapStreams(ch, if (src == v.h_alt) ch.h_alt else src);
+    try pm(e, .mix);
     try spGatherX(e, ch);
 }
 
@@ -1149,7 +1294,9 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
         try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
     }
     try routeSpans(e, ch, lay, shared_id, sl, kc);
+    try pm(e, .router);
     if (e.two) |t| return t.experts(e, ch, lay); // 2D: gate / up here, the intermediate's exchange, down here
+    defer pm(e, .moe) catch {};
     // routed(): a chunk of fewer than EXACT_ROWS rows takes the decode window's fused path and scratch
     if (n < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
     try exl3_experts.prompt(e.ex, e.s, lay.experts, ch.xs, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
@@ -1302,6 +1449,7 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
         try tri_basic.hcPost(e.t, ch.gm, v.h, v.post, v.comb, v.h, e.world, v.rows, c.hidden);
         ch.pending = false;
     }
+    try pm(e, .mix);
     if (ch.sp != null and ch.spans.len > 0) return error.SpWithImages;
     const li32: u16 = @intCast(li);
     const l = std.mem.indexOfScalar(u16, c.engram_layers.slice(), li32) orelse return error.NotAnEngramLayer;
@@ -1327,10 +1475,12 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
         engram.decodeRows(eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s], eh.rows[0 .. m * t.row_w], m, t.row_w, t.row_s, 8); // the rows on 8 threads
     }
     if (m * t.row_w != n * ew.k) return error.EngramShape;
+    try pm(e, .host); // (the rows read here when no read-ahead had them: the GPU idle meanwhile)
     if (prof) eh.p_rows += lap(e, eh, &tq);
     try upload(e, ch.eb, rows.ptr, m * t.row_w * 2);
     if (prof) eh.p_upload += lap(e, eh, &tq);
     try mm(e, ch, ew, ch.eb, ew.k, ch.ek, .fp32, ew.n);
+    try pm(e, .engram);
     if (prof) eh.p_mm += lap(e, eh, &tq);
     // 2D (model.py esum): this node's columns of its rank's projection; the quarters give both ranks' whole ones
     const en = if (e.two) |two| two.engramWidth() else ew.n;
@@ -1341,6 +1491,7 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
         if (prof) eh.p_x += lap(e, eh, &tq);
     } else {
         if (e.two) |two| try two.quarters(e, ch.ek, ch.ekg, n, two.ew, 4) else try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
+        try pm(e, .comm);
         if (prof) eh.p_x += lap(e, eh, &tq);
         if (e.world != 2) return notPorted(@src()); // Comm.sum of more ranks: acc += g[r]
         try e.ops.add2Bf16(e.s, ch.ekg, ch.ekg + n * en * 4, ch.kv, n * en);
@@ -1354,6 +1505,7 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
         const o = overlap(sp, ch.start, n) orelse continue;
         try e.ops.copyRows(e.s, ch.h_alt + o[0] * rowb, rowb, ch.h + o[0] * rowb, rowb, rowb, o[1] - o[0]);
     }
+    try pm(e, .engram);
     if (prof) {
         eh.p_gate += lap(e, eh, &tq);
         eh.p_calls += 1;
@@ -1408,7 +1560,14 @@ pub fn replayCut(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     try kvSourceUpdate(e, ch, cs, sh, li);
     const first = @max(ch.start, replay) - ch.start;
     if (first >= ch.n) return false;
-    if (ch.sp != null) return error.SpPastReplay; // SP rows are for encoder-only chunks (spFits)
+    if (ch.sp) |sp| {
+        // TF_DS_PROMPT_SP=rows: encoder-only chunks alone (spFits). rows2's chunk reaching the replay: its rows from the
+        // replay on (each node mixed its own) to every node, then replicated from here as without SP rows
+        if (!sp.cut or first == 0) return error.SpPastReplay;
+        try spCutRows(e, ch, sp, first);
+        try pm(e, .comm);
+        ch.sp = null;
+    }
     if (first == 0) return true;
     const c = e.c;
     const n = ch.n - first;
@@ -1423,6 +1582,8 @@ pub fn replayCut(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     // pos[first:]: a view, first * 8 bytes in (its alignment is the one the served kernels were specialized for)
     _ = host_pos;
     ch.pos += first * 8;
+    try pm(e, .other);
+    if (e.prof) |p| p.cut(n);
     return true;
 }
 
@@ -1436,6 +1597,7 @@ pub fn tap(e: *const Engine, ch: *Chunk, j: usize) !void {
         ch.pending = false;
     }
     try e.exact.hcMean4(e.s, v.h, ch.taps + j * ch.cap * c.hidden * 2 + v.r0 * c.hidden * 2, c.hidden, v.rows, c.hidden);
+    try pm(e, .mix);
 }
 
 /// Tap j's rows (bf16 [n, D]).
@@ -1459,6 +1621,8 @@ pub fn head(e: *const Engine, ch: *Chunk) !void {
     try tri_basic.collapseNorm(e.t, last_h, last_pre, e.w.norm, ch.head_x, c.eps, 1, c.hidden);
     const hl = e.w.head;
     try mmRows(e, ch, 1, hl, ch.head_x, c.hidden, ch.head_l, .fp32, hl.n);
+    try pm(e, .other);
+    defer pm(e, .comm) catch {};
     if (e.two) |t| return t.quarters(e, ch.head_l, ch.head_g, 1, t.hw, 4); // 2D: the vocabulary quarters, TP2's layout
     try e.comm.allGather(ch.head_l, ch.head_g, hl.n, .f32, e.s);
 }
@@ -1531,7 +1695,8 @@ test "SP rows: four owners' quarters cover the chunk in whole 16-row tiles; only
         for (0..4) |g| {
             var ch: Chunk = undefined;
             ch.n = n;
-            ch.sp = .{ .g = g, .q = n / 4 };
+            ch.sp = Sp.of(g, n, false);
+            try std.testing.expectEqual(n / 4, ch.sp.?.q); // rows' quarters, as before
             const mr = mixRows(&ch);
             try std.testing.expectEqual(covered, mr.r0);
             try std.testing.expect(mr.rows % 16 == 0);
@@ -1543,4 +1708,85 @@ test "SP rows: four owners' quarters cover the chunk in whole 16-row tiles; only
     whole.n = 1234;
     whole.sp = null;
     try std.testing.expectEqual(MixRows{ .r0 = 0, .rows = 1234 }, mixRows(&whole));
+}
+
+test "TF_DS_PROMPT_SP: rows keeps its chunks; rows2 adds the chunk reaching the replay and any n >= 256" {
+    // (n, start, replay): an encoder chunk, the head chunk of an 8,213-token prompt, a 12,345-token prompt's last chunk,
+    // a 4,224-token prompt's, a one-chunk prompt, a decoder chunk, a short one, a pass of two chunks
+    const Case = struct { n: usize, start: usize, replay: usize, rows: bool, rows2: bool, cut: bool };
+    const cases = [_]Case{
+        .{ .n = 2048, .start = 0, .replay = 8085, .rows = true, .rows2 = true, .cut = false },
+        .{ .n = 2048, .start = 6144, .replay = 8085, .rows = false, .rows2 = true, .cut = true },
+        .{ .n = 2105, .start = 10240, .replay = 12217, .rows = false, .rows2 = true, .cut = true },
+        .{ .n = 2176, .start = 2048, .replay = 4096, .rows = false, .rows2 = true, .cut = true },
+        .{ .n = 1500, .start = 0, .replay = 1372, .rows = false, .rows2 = true, .cut = true },
+        .{ .n = 21, .start = 8192, .replay = 8085, .rows = false, .rows2 = false, .cut = false },
+        .{ .n = 200, .start = 0, .replay = 72, .rows = false, .rows2 = false, .cut = false },
+        .{ .n = 4096, .start = 0, .replay = 8064, .rows = true, .rows2 = true, .cut = false },
+    };
+    for (cases) |cs| {
+        for (0..4) |g| {
+            const a = spFor(.rows, g, cs.n, cs.start, cs.replay, 0);
+            const b = spFor(.rows2, g, cs.n, cs.start, cs.replay, 0);
+            try std.testing.expectEqual(cs.rows, a != null);
+            try std.testing.expectEqual(cs.rows2, b != null);
+            try std.testing.expect(spFor(.off, g, cs.n, cs.start, cs.replay, 0) == null);
+            try std.testing.expect(spFor(.rows2, g, cs.n, cs.start, cs.replay, 1) == null); // image spans
+            // where rows takes a chunk, rows2 takes it the same way (the same owners, no cut)
+            if (a) |x| try std.testing.expectEqual(x, b.?);
+            if (b) |x| try std.testing.expectEqual(cs.cut, x.cut);
+        }
+    }
+}
+
+test "rows2's cut: every node ends with rows [first, n) from their owners, each send matched by one receive" {
+    for ([_]usize{ 256, 300, 1500, 2048, 2105, 2176 }) |n| {
+        const o = prompt2d.Owners.of(n);
+        var first: usize = 1;
+        while (first < n) : (first += 7) {
+            // have[node][row]: the node holds the row (its own rows from its mixes, then what it receives)
+            var have: [4][2176]bool = @splat(@splat(false));
+            var plans: [4][6]CutXfer = undefined;
+            var counts: [4]usize = undefined;
+            for (0..4) |me| {
+                for (o.r0(me)..o.r0(me) + o.rows(me)) |r| have[me][r] = true;
+                counts[me] = cutPlan(o, me, first, &plans[me]);
+            }
+            for (0..4) |me| for (plans[me][0..counts[me]]) |x| {
+                try std.testing.expect(x.row >= first and x.row + x.rows <= n);
+                if (!x.send) {
+                    // the peer posts the matching send: the same rows, to me, and they are its own
+                    var matched: usize = 0;
+                    for (plans[x.peer][0..counts[x.peer]]) |y| {
+                        if (y.send and y.peer == me) {
+                            try std.testing.expectEqual(x.row, y.row);
+                            try std.testing.expectEqual(x.rows, y.rows);
+                            matched += 1;
+                        }
+                    }
+                    try std.testing.expectEqual(@as(usize, 1), matched);
+                    try std.testing.expect(x.row >= o.r0(x.peer) and x.row + x.rows <= o.r0(x.peer) + o.rows(x.peer));
+                    for (x.row..x.row + x.rows) |r| {
+                        try std.testing.expect(!have[me][r]); // never over a row the node already holds
+                        have[me][r] = true;
+                    }
+                } else {
+                    try std.testing.expect(x.row >= o.r0(me) and x.row + x.rows <= o.r0(me) + o.rows(me));
+                }
+            };
+            for (0..4) |me| for (first..n) |r| try std.testing.expect(have[me][r]);
+        }
+    }
+}
+
+test "rows2's x: the all-gather of q rows a node and node 3's tail cover every row once" {
+    var n: usize = 256;
+    while (n <= 4096) : (n += 13) {
+        const o = prompt2d.Owners.of(n);
+        const t = o.tail();
+        // all-gather: node g's q rows at g q; the tail: node 3's rows from 4 q
+        try std.testing.expectEqual(4 * o.q, t[0]);
+        try std.testing.expectEqual(n, 4 * o.q + t[1]);
+        try std.testing.expectEqual(o.r0(3) + o.rows(3), t[0] + t[1]); // the tail is node 3's
+    }
 }

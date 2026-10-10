@@ -32,6 +32,7 @@ pub const ops = @import("ops.zig");
 pub const exl3_experts = @import("exl3_experts.zig");
 pub const exl3_experts_rec = @import("exl3_experts_rec.zig");
 pub const prompt = @import("prompt.zig");
+pub const pprof = @import("pprof.zig");
 pub const exact = @import("exact.zig");
 pub const rdma_seq = @import("rdma_seq.zig");
 pub const rdma = @import("rdma.zig");
@@ -78,6 +79,7 @@ test {
     refAll(exl3_experts);
     refAll(exl3_experts_rec);
     refAll(prompt);
+    refAll(pprof);
     refAll(exact);
     refAll(rdma_seq);
     refAll(rdma);

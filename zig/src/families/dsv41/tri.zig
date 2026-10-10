@@ -21,6 +21,13 @@ pub const Tri = struct {
         try t.set.?.run(t.stream, name, grid, args, consts);
     }
 
+    /// `run`, the variant matched as `relax` allows when none was captured for the launch exactly (aot.Set.findRelaxed);
+    /// a test log keeps the launch as given.
+    pub fn runRelaxed(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const, relax: aot.Relax) !void {
+        if (t.log) |l| return l.add(name, grid, args, consts);
+        try t.set.?.runRelaxed(t.stream, name, grid, args, consts, relax);
+    }
+
     /// The PDL constexpr a wrapper passes when its kernel takes one (_pdl() in kernels.py).
     pub fn pdlConst(t: Tri) aot.Const {
         return aot.ci("PDL", @intFromBool(t.pdl));

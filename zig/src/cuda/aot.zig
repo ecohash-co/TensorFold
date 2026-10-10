@@ -57,6 +57,22 @@ pub fn cf(name: []const u8, v: f32) Const {
 
 const Variant = struct { spec: KernelJson, kernel: triton.Kernel };
 
+/// What a call site has shown its kernel's code does not depend on, for a launch no variant was captured for exactly:
+/// `ints` may be divisible by 16 where the variant was compiled for any value (never the other way), `ptrs8` may be
+/// 8- but not 16-aligned where the variant assumed 16 (arguments the code reads as one 8-byte scalar, or not at all).
+/// Only constexprs and every other argument's specialization as captured; empty: Triton's exact choice only.
+pub const Relax = struct {
+    ints: []const []const u8 = &.{},
+    ptrs8: []const []const u8 = &.{},
+
+    fn has(names: []const []const u8, name: []const u8) bool {
+        for (names) |x| if (std.mem.eql(u8, x, name)) return true;
+        return false;
+    }
+};
+
+var relaxed_logged = std.atomic.Value(bool).init(false);
+
 pub const Set = struct {
     parsed: std.json.Parsed(SetJson),
     variants: []Variant,
@@ -100,10 +116,22 @@ pub const Set = struct {
 
     /// The variant of `function` compiled for these constexprs and these arguments' specialization.
     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
+        return self.findRelaxed(function, args, consts, .{});
+    }
+
+    /// `find`, and without an exact variant the first one whose specialization differs only as `relax` allows.
+    pub fn findRelaxed(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const, relax: Relax) !*const Variant {
         for (self.variants) |*v| {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
-            if (matches(v.spec, args, consts)) return v;
+            if (matches(v.spec, args, consts, .{})) return v;
         }
+        if (relax.ints.len + relax.ptrs8.len > 0) for (self.variants) |*v| {
+            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
+            if (matches(v.spec, args, consts, relax)) {
+                if (!relaxed_logged.swap(true, .monotonic)) std.log.info("no exact captured variant of {s}: took {s} (a specialization its code does not depend on)", .{ function, v.spec.hash });
+                return v;
+            }
+        };
         std.log.err("no captured Triton variant of {s} for this launch:", .{function});
         for (args) |a| switch (a.value) {
             .ptr => |p| std.log.err("  {s}: {s} at {x} (16-aligned {})", .{ a.name, p.ty, p.addr, p.addr % 16 == 0 }),
@@ -127,7 +155,12 @@ pub const Set = struct {
 
     /// Launches `function` on `grid` as Triton's launcher would: runtime arguments in the variant's order, scratch null.
     pub fn run(self: *const Set, stream: Stream, function: []const u8, grid: [3]u32, args: []const Arg, consts: []const Const) !void {
-        const v = try self.find(function, args, consts);
+        return self.runRelaxed(stream, function, grid, args, consts, .{});
+    }
+
+    /// `run` with the variant from `findRelaxed`.
+    pub fn runRelaxed(self: *const Set, stream: Stream, function: []const u8, grid: [3]u32, args: []const Arg, consts: []const Const, relax: Relax) !void {
+        const v = try self.findRelaxed(function, args, consts, relax);
         var packed_args: launch.Args = .{};
         for (v.spec.params) |p| {
             const a = lookup(args, p.name).?;
@@ -147,7 +180,7 @@ fn lookup(args: []const Arg, name: []const u8) ?Arg {
     return null;
 }
 
-fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
+fn matches(k: KernelJson, args: []const Arg, consts: []const Const, relax: Relax) bool {
     for (consts) |c| {
         const got = k.consts.map.get(c.name) orelse return false;
         if (c.int) |x| if (got.int == null or got.int.? != x) return false;
@@ -169,11 +202,14 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
                 const p = param.?;
                 if (!std.mem.eql(u8, p.type, "i32")) return false;
                 if (!p.nospec and x == 1) return false;
-                if (p.div16 != (!p.nospec and @mod(x, 16) == 0)) return false;
+                const div16 = !p.nospec and @mod(x, 16) == 0;
+                if (p.div16 != div16 and !(div16 and !p.div16 and Relax.has(relax.ints, a.name))) return false;
             },
             .ptr => |x| {
                 const p = param orelse return false;
-                if (!std.mem.eql(u8, p.type, x.ty) or p.div16 != (x.addr % 16 == 0)) return false;
+                if (!std.mem.eql(u8, p.type, x.ty)) return false;
+                const al16 = x.addr % 16 == 0;
+                if (p.div16 != al16 and !(p.div16 and x.addr % 8 == 0 and Relax.has(relax.ptrs8, a.name))) return false;
             },
             .f32 => {
                 const p = param orelse return false;
@@ -187,4 +223,35 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
         runtime += 1;
     }
     return runtime == k.params.len;
+}
+
+test "relaxed matching: div-16 ints onto any-value params and 8-aligned pointers onto 16-aligned ones, only as listed" {
+    const gpa = std.testing.allocator;
+    const expect = std.testing.expect;
+    var params = [_]ParamJson{
+        .{ .name = "VIS", .type = "*i64", .div16 = true, .nospec = false },
+        .{ .name = "n", .type = "i32", .div16 = false, .nospec = false },
+    };
+    var k: KernelJson = .{ .@"fn" = "f", .hash = "h", .name = "f", .num_warps = 4, .params = &params, .consts = .{} };
+    defer k.consts.map.deinit(gpa);
+    try k.consts.map.put(gpa, "KEYS", .{ .int = 0 });
+    const consts = [_]Const{ci("KEYS", 0)};
+    const relax: Relax = .{ .ints = &.{"n"}, .ptrs8 = &.{"VIS"} };
+    // the captured key itself, either way
+    try expect(matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421) }, &consts, .{}));
+    try expect(matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421) }, &consts, relax));
+    // n divisible by 16 onto the any-value n: relaxed only, and only when listed
+    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 145152) }, &consts, .{}));
+    try expect(matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 145152) }, &consts, relax));
+    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 145152) }, &consts, .{ .ptrs8 = &.{"VIS"} }));
+    // an 8-aligned VIS onto the 16-aligned one: relaxed only; 4-aligned never
+    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1008), int("n", 146421) }, &consts, .{}));
+    try expect(matches(k, &.{ ptr("VIS", "*i64", 0x1008), int("n", 146421) }, &consts, relax));
+    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1004), int("n", 146421) }, &consts, relax));
+    // the value 1 (a constexpr of its own variant) and other constexprs are never relaxed
+    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 1) }, &consts, relax));
+    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421) }, &.{ci("KEYS", 1)}, relax));
+    // never the other way: a variant compiled for div-16 n does not take n = 146421
+    params[1].div16 = true;
+    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421) }, &consts, relax));
 }

@@ -23,6 +23,12 @@
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
 //!   TF_DS_SERVED_K=all|solo                     a stream verifies at most the served lane's choice of drafts (its
 //!                                               round table and draft ms): at any streams, or one stream alone
+//!   TF_DS_PROMPT_CHUNK=4096                     prompt passes of two 2,048-row chunks where both end by the replay
+//!                                               (model.passRows; unset: one chunk a pass, as served)
+//!   TF_DS_PROMPT_SP=rows                        world 4: SP rows on encoder-only chunks (prompt.spFits) and catRank
+//!                                               by send / recv with the column partner
+//!   TF_DS_PROMPT_OVERLAP=1                      world 4 with TF_DS_PROMPT_CHUNK=4096: a pass's two chunks one layer
+//!                                               apart on two streams and NCCL communicators (model.Overlap)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the

@@ -50,6 +50,30 @@ pub fn spRows() bool {
     return std.mem.eql(u8, std.mem.span(v), "rows");
 }
 
+/// TF_DS_PROMPT_OVERLAP=1 (four-node split, with TF_DS_PROMPT_CHUNK=4096): an encoder-only pass's two chunks run one
+/// layer apart, the second on a stream, buffer set and NCCL communicator of its own (Overlap), launched from this one
+/// thread in a fixed order, so one chunk's exchanges run under the other's kernels. Each chunk runs the 2,048-row
+/// chunk's own launches.
+pub fn promptOverlap() bool {
+    const v = std.c.getenv("TF_DS_PROMPT_OVERLAP") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+/// The second chunk's own state of an overlapped pass (promptOverlap): its stream, NCCL communicator (the same four
+/// ranks), 2D exchange buffers, cuBLAS handle, engine and chunk buffers; an event at each of the first chunk's layer
+/// ends (the second chunk's layer waits for the first's: its window keys, compressed rows and positional stores) and
+/// one at the second chunk's end (the main stream waits for it before anything after the pass).
+pub const Overlap = struct {
+    stream: cuda.Stream,
+    comm: comm_mod.Comm,
+    two: prompt2d.Two,
+    blas: cublas.Blas,
+    eng: prompt.Engine,
+    ch: prompt.Chunk,
+    ev: []cuda.Event,
+    done: cuda.Event,
+};
+
 /// The rows of the prompt pass from `start` (a chunk end) of a prompt of `len` rows with the bounded replay at
 /// `replay`: two whole chunks when passes take 4,096 rows and both end at or before the replay (an encoder-only pass,
 /// every decoder row in a chunk of its own as on 2,048-row passes), else the chunk from start.
@@ -189,6 +213,7 @@ pub const Model = struct {
     // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
     two: ?prompt2d.Two = null,
     pass_rows: usize = chunk_rows, // a prompt pass's rows at most (promptChunk)
+    ov: ?*Overlap = null, // the overlapped passes' second chunk (promptOverlap)
     sp_rows: bool = false, // SP rows on encoder-only chunks (spRows; world 4)
     rdma_rings: ?ring2d.Rings = null,
 
@@ -242,6 +267,7 @@ pub const Model = struct {
         m.two = null;
         m.rdma_rings = null;
         m.pass_rows = try promptChunk();
+        m.ov = null;
         m.sp_rows = spRows();
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
@@ -268,6 +294,14 @@ pub const Model = struct {
         errdefer m.fan.close();
         m.comm = try m.fan.comm(o.rank, o.world);
         errdefer m.comm.deinit();
+        // overlapped passes: their second NCCL communicator, right after the first on every rank (the unique id goes
+        // down the same links in the same order)
+        var comm2: ?comm_mod.Comm = null;
+        if (promptOverlap()) {
+            if (o.world != 4 or m.pass_rows != max_pass_rows) return error.OverlapNeedsFourNodesAndPasses;
+            comm2 = try m.fan.comm(o.rank, o.world);
+        }
+        errdefer if (comm2) |*x| x.deinit();
         // TP2: the decode gathers' RDMA ring (both ranks connect before either returns)
         if (sp.pair == null and o.rdma_devices != null) {
             const list = o.rdma_devices.?;
@@ -365,6 +399,30 @@ pub const Model = struct {
                 m.dr.?.graphs = &m.pgraphs.?;
             }
         }
+        if (comm2) |cm| {
+            // the overlapped passes' second chunk: the same engine on its own stream, communicator, exchange buffers,
+            // cuBLAS handle and 2,048-row chunk buffers
+            const ov = try gpa.create(Overlap);
+            errdefer gpa.destroy(ov);
+            ov.stream = try cuda.Stream.init(d, true);
+            ov.comm = cm;
+            comm2 = null;
+            ov.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, chunk_rows);
+            ov.two.p2p_cat = m.sp_rows;
+            ov.eng = m.eng;
+            ov.eng.s = ov.stream;
+            ov.eng.t.stream = ov.stream;
+            ov.eng.comm = &ov.comm;
+            ov.eng.two = &ov.two;
+            ov.ch = try prompt.Chunk.init(&ov.eng, &m.arena, chunk_rows, m.ctx_cap);
+            ov.blas = try cublas.Blas.open(ov.stream, ov.ch.blas_ws);
+            ov.eng.blas = &ov.blas;
+            ov.ev = try a.alloc(cuda.Event, c.layers / 2 + 1);
+            for (ov.ev) |*x| x.* = try cuda.Event.init(d, false);
+            ov.done = try cuda.Event.init(d, false);
+            try ov.stream.synchronize();
+            m.ov = ov;
+        }
         try m.stream.synchronize();
         try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize"); // the setup's legacy-stream copies too
 
@@ -419,6 +477,16 @@ pub const Model = struct {
         if (m.ptimer) |t| {
             t.deinit();
             m.gpa.destroy(t);
+        }
+        if (m.ov) |ov| {
+            ov.stream.synchronize() catch {};
+            ov.blas.close();
+            for (ov.ev) |*x| x.deinit();
+            ov.done.deinit();
+            ov.comm.deinit();
+            ov.stream.deinit();
+            m.gpa.destroy(ov);
+            m.ov = null;
         }
         m.rd.dropSide(&m.eng);
         m.rd.dropPrefetch();
@@ -627,6 +695,8 @@ pub const Model = struct {
         // image token's, which its span row then replaces
         const image_id: i64 = if (c.image_token) |t| t else 0;
         for (0..n) |j| m.ids64[j] = if (seq[start + j] < 0) image_id else seq[start + j];
+        // an encoder-only pass of two chunks, overlapped (the same choice on every rank: n and the spans)
+        if (m.ov != null and n == 2 * chunk_rows and ch.spans.len == 0) return m.fillOverlap(seq, start, n, replay);
         var shared: prompt.Shared = .{};
         const pt = m.ptimer;
         if (pt) |t| try t.mark(m.stream, .start);
@@ -730,6 +800,95 @@ pub const Model = struct {
             try t.finish();
         }
         return true;
+    }
+
+    /// An encoder-only pass of two chunks (fillChunk with Overlap): chunk A [start, start + 2,048) on this stream and
+    /// buffers, chunk B after it on the Overlap's, one layer apart: step k issues A's layer k (and records its event),
+    /// then B's layer k - 1 behind A's event for that layer, so B's layer reads A's window keys, compressed rows and
+    /// positional stores as the next chunk would; each chunk is the 2,048-row chunk's launches. The main stream waits
+    /// for B's end. The Engram rows of both come from the pass's read-ahead (read here if it is not ready); the next
+    /// pass's starts after B's last Engram layer. False: an encoder-only pass reaches no head.
+    fn fillOverlap(m: *Model, seq: []const i32, start: usize, n: usize, replay: usize) !bool {
+        const ov = m.ov.?;
+        const half = chunk_rows;
+        const c = m.eng.c;
+        const cut = c.layers / 2;
+        const ne = @min(2, c.engram_layers.slice().len);
+        if (m.eh) |*eh| {
+            m.joinAhead();
+            var ready = eh.ahead_start == start and eh.ahead_n == n and eh.ahead_err == null;
+            for (0..ne) |j| ready = ready and eh.ahead_ready[j];
+            if (!ready) {
+                eh.ahead_start = start;
+                eh.ahead_n = n;
+                eh.ahead_ready = .{ false, false };
+                eh.ahead_err = null;
+                prompt.engramReadAheadAll(eh, c, seq, start, n);
+            }
+            if (eh.ahead_err) |err| return err;
+        }
+        const ea = &m.eng;
+        const eb = &ov.eng;
+        const cha = &m.ch;
+        const chb = &ov.ch;
+        try prompt.begin(ea, cha, m.ids64[0..half], start, m.host_pos[0..half]);
+        try prompt.begin(eb, chb, m.ids64[half..n], start + half, m.host_pos[half..n]);
+        for ([_]*prompt.Chunk{ cha, chb }, [_]usize{ start, start + half }) |ch, s0| {
+            ch.sub_rows = 0;
+            ch.sp = null;
+            if (m.sp_rows) if (m.two) |t| if (prompt.spFits(half, s0, replay, 0)) {
+                ch.sp = .{ .g = t.r + 2 * t.p, .q = half / 4 };
+            };
+        }
+        var sha: prompt.Shared = .{};
+        var shb: prompt.Shared = .{};
+        const last_engram: ?usize = if (ne > 0) c.engram_layers.slice()[ne - 1] else null;
+        for (0..cut + 2) |step| {
+            if (step <= cut) {
+                try m.encoderLayer(ea, cha, &sha, seq, step, replay);
+                try ov.ev[step].record(m.stream);
+            }
+            if (step >= 1) {
+                const li = step - 1;
+                try ov.stream.wait(ov.ev[li]);
+                try m.encoderLayer(eb, chb, &shb, seq, li, replay);
+                if (m.eh) |*eh| if (last_engram != null and li == last_engram.? and m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
+                    // the next pass's rows while this one's last layers run
+                    const nn = passRows(m.pass_rows, start + n, m.fill_seq.len, replay);
+                    eh.ahead_start = start + n;
+                    eh.ahead_n = nn;
+                    eh.ahead_ready = .{ false, false };
+                    eh.ahead_err = null;
+                    m.ahead = std.Thread.spawn(.{}, prompt.engramReadAheadAll, .{ eh, c, m.fill_seq[0 .. start + n + nn], start + n, nn }) catch null;
+                };
+            }
+        }
+        try ov.done.record(ov.stream);
+        try m.stream.wait(ov.done);
+        return false;
+    }
+
+    /// Layer li of an encoder-only chunk on engine `e` (fillChunk's layer without the profile): at the decoder's first
+    /// layer its mixes and kv-source update, where the chunk ends.
+    fn encoderLayer(m: *Model, e: *const prompt.Engine, ch: *prompt.Chunk, sh: *prompt.Shared, seq: []const i32, li: usize, replay: usize) !void {
+        const c = e.c;
+        if (li == c.layers / 2) {
+            if (try prompt.replayCut(e, ch, &m.view, sh, li, replay, m.host_pos)) return error.OverlapPastReplay;
+            return;
+        }
+        if (e.w.layers[li].engram_wkv != null) {
+            const eh = if (m.eh) |*x| x else return error.NoEngramTables;
+            if (eh.ahead_err) |err| return err;
+            try prompt.engramApply(e, ch, eh, li, seq);
+        }
+        if (m.dr != null) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j);
+        try prompt.attnMixes(e, ch, li);
+        try prompt.attention(e, ch, &m.view, sh, li, m.ring_view[li], 0, false);
+        try prompt.gather(e, ch, ch.pa, ch.ga);
+        try prompt.ffnMixes(e, ch, li);
+        try prompt.moe(e, ch, li);
+        try prompt.gather(e, ch, ch.pm, ch.gm);
+        prompt.endLayer(ch);
     }
 
     /// The prompt's logits (its last row's, the ranks' columns in rank order) after a fill's last chunk.

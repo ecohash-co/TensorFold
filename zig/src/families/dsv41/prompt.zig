@@ -1311,9 +1311,11 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     var tq = if (prof) pstamp(e, eh) else 0;
     // the rows read ahead (fillChunk's thread) when they are this chunk's, else read here
     var rows: []u16 = eh.rows;
-    if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n == n) {
-        rows = eh.ahead_rows[l];
-        eh.ahead_ready[l] = false;
+    // (a read-ahead of a whole pass serves each of its chunks: their rows from the chunk's offset in it; it is used up
+    // with the pass's last row)
+    if (l < 2 and eh.ahead_ready[l] and ch.start >= eh.ahead_start and ch.start + n <= eh.ahead_start + eh.ahead_n) {
+        rows = eh.ahead_rows[l][(ch.start - eh.ahead_start) * k * t.row_w ..];
+        if (ch.start + n == eh.ahead_start + eh.ahead_n) eh.ahead_ready[l] = false;
     } else {
         eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
         for (0..n) |r| {

@@ -684,6 +684,8 @@ pub fn begin(e: *const Engine, ch: *Chunk, ids: []const i64, start: usize, host_
     ch.n = n;
     ch.start = start;
     ch.pending = false;
+    ch.sub_rows = 0; // (a pass of two chunks and SP rows are the caller's to set, chunk by chunk)
+    ch.sp = null;
     for (host_pos[0..n], 0..) |*p, i| p.* = @intCast(start + i);
     try upload(e, ch.ids, ids.ptr, n * 8);
     ch.pos = ch.pos0;

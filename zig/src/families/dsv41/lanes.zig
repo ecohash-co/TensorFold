@@ -146,6 +146,22 @@ fn clashes(used: []const [2]usize, lo: usize, hi: usize) bool {
     return false;
 }
 
+/// Whether a prompt pass keeps a state at chunk end `at` (prefillFn's hook: the cache's marks and the last chunk end
+/// before the replay).
+fn keepsAt(hooked: bool, marks: []const u32, at: usize, len: usize, replay: usize, last_end: usize) bool {
+    return hooked and at < len and at <= replay and (at == last_end or markEnds(marks, at));
+}
+
+test "a pass of two chunks stops where the prompt cache keeps a state" {
+    const c = model.chunk_rows;
+    try std.testing.expect(keepsAt(true, &.{}, 3 * c, 10 * c, 9 * c, 3 * c));
+    const mk = [_]u32{3 * c + 7};
+    try std.testing.expect(keepsAt(true, &mk, 3 * c, 10 * c, 9 * c, 8 * c));
+    try std.testing.expect(!keepsAt(true, &mk, 2 * c, 10 * c, 9 * c, 8 * c));
+    try std.testing.expect(!keepsAt(false, &.{}, 3 * c, 10 * c, 9 * c, 3 * c));
+    try std.testing.expect(!keepsAt(true, &.{}, 10 * c, 10 * c, 10 * c, 10 * c));
+}
+
 /// Whether one of the prompt cache's marks has its chunk end at `at` (each kept at the chunk end at or before it).
 fn markEnds(marks: []const u32, at: usize) bool {
     for (marks) |w| if (w / model.chunk_rows * model.chunk_rows == at) return true;
@@ -544,7 +560,10 @@ pub const Lanes = struct {
         }
         while (start < len) {
             if (start > 0 and s.isCancelled()) return error.Cancelled;
-            const n = @min(model.chunk_rows, len - start);
+            // TF_DS_PROMPT_CHUNK=4096: two chunks a pass where both end by the replay, but never past a chunk end
+            // where the prompt cache keeps a state (the kept states stay where 2,048-row chunks keep them)
+            var n = model.passRows(m.pass_rows, start, len, replay);
+            if (n > model.chunk_rows and (s.images.len > 0 or keepsAt(s.reuse.hook != null, s.reuse.marks, start + model.chunk_rows, len, replay, last_end))) n = model.chunk_rows;
             if (try self.begin(.fill_chunk)) {
                 try self.wire.int(gpa, u64, start);
                 try self.wire.int(gpa, u32, @intCast(n));

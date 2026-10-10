@@ -31,6 +31,32 @@ const rdma = @import("rdma.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
+/// A prompt pass's rows at most (TF_DS_PROMPT_CHUNK=4096: two chunks a pass, passRows).
+pub const max_pass_rows = 2 * chunk_rows;
+
+/// TF_DS_PROMPT_CHUNK: a prompt pass's rows at most, 2,048 (unset: the served chunk, every pass one chunk) or 4,096
+/// (passRows: two chunks in one pass where both end at or before the replay).
+pub fn promptChunk() !usize {
+    const v = std.c.getenv("TF_DS_PROMPT_CHUNK") orelse return chunk_rows;
+    const x = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadPromptChunk;
+    if (x != chunk_rows and x != max_pass_rows) return error.BadPromptChunk;
+    return x;
+}
+
+/// TF_DS_PROMPT_SP=rows: SP rows on the four-node split's encoder-only prompt chunks (prompt.spFits): each node mixes
+/// its quarter of the rows, the partials go to the rows' owners and x is all-gathered; catRank by send / recv.
+pub fn spRows() bool {
+    const v = std.c.getenv("TF_DS_PROMPT_SP") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "rows");
+}
+
+/// The rows of the prompt pass from `start` (a chunk end) of a prompt of `len` rows with the bounded replay at
+/// `replay`: two whole chunks when passes take 4,096 rows and both end at or before the replay (an encoder-only pass,
+/// every decoder row in a chunk of its own as on 2,048-row passes), else the chunk from start.
+pub fn passRows(pass: usize, start: usize, len: usize, replay: usize) usize {
+    if (pass > chunk_rows and start % chunk_rows == 0 and start + pass <= replay and start + pass <= len) return pass;
+    return @min(chunk_rows, len - start);
+}
 /// The pool's streams (--parallel 4).
 pub const max_streams = draft.max_streams;
 /// The pool's streams when unset (--parallel 4).
@@ -162,6 +188,8 @@ pub const Model = struct {
     t_absorb: u64 = 0,
     // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
     two: ?prompt2d.Two = null,
+    pass_rows: usize = chunk_rows, // a prompt pass's rows at most (promptChunk)
+    sp_rows: bool = false, // SP rows on encoder-only chunks (spRows; world 4)
     rdma_rings: ?ring2d.Rings = null,
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
@@ -213,6 +241,8 @@ pub const Model = struct {
         m.pgraphs = null;
         m.two = null;
         m.rdma_rings = null;
+        m.pass_rows = try promptChunk();
+        m.sp_rows = spRows();
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
@@ -293,7 +323,8 @@ pub const Model = struct {
         // round over NCCL world 4)
         errdefer if (m.rdma_rings) |*x| x.close(gpa);
         if (sp.pair != null) {
-            m.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, chunk_rows);
+            m.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, m.pass_rows);
+            m.two.?.p2p_cat = m.sp_rows;
             if (o.rdma_devices) |devs| {
                 const image: []const u8 = if (o.rdma_kernels) |path|
                     try std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 26), .@"16", null)
@@ -309,7 +340,7 @@ pub const Model = struct {
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
         m.eng.round_rows = o.round_rows;
         if (m.par) |*x| m.eng.par = x;
-        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, m.ctx_cap); // a stream's keys at most
+        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, m.pass_rows, m.ctx_cap); // a stream's keys at most
         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
         errdefer m.blas.close();
@@ -350,7 +381,7 @@ pub const Model = struct {
             };
             m.tables = try engram_io.Tables.open(gpa, io, edir);
             m.epool = try engram_io.Pool.init(gpa, io, 64);
-            m.eh = try prompt.EngramHost.init(a, c, engram.Hasher.init(c.*, map, mult), &m.tables.?, m.epool.?, sp.rank, sp.world, chunk_rows);
+            m.eh = try prompt.EngramHost.init(a, c, engram.Hasher.init(c.*, map, mult), &m.tables.?, m.epool.?, sp.rank, sp.world, m.pass_rows);
             if (o.engram_aio) {
                 // a round's reads, 2 x 12 x its rows at most: 1,024 slots for each 16 rows of the round-row setting
                 m.aio = try engram_aio.Aio.init(gpa, io, 1024 * ((o.round_rows + 15) / 16));
@@ -367,8 +398,8 @@ pub const Model = struct {
             m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
         }
 
-        m.host_pos = try a.alloc(i64, chunk_rows);
-        m.ids64 = try a.alloc(i64, chunk_rows);
+        m.host_pos = try a.alloc(i64, m.pass_rows);
+        m.ids64 = try a.alloc(i64, m.pass_rows);
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
         return m;
@@ -586,7 +617,9 @@ pub const Model = struct {
     /// the decoder's first layer). A chunk that reaches the head leaves the logits of its last row in ch.head_g and,
     /// drafting, its DSpark taps absorbed into the slot's drafter rings. True when it reached the head.
     pub fn fillChunk(m: *Model, seq: []const i32, start: usize, n: usize, replay: usize) !bool {
-        if (n == 0 or n > chunk_rows or seq.len != start + n) return error.BadChunk;
+        if (n == 0 or n > m.pass_rows or seq.len != start + n) return error.BadChunk;
+        // a pass of two chunks: whole chunks from a chunk end, encoder-only (passRows)
+        if (n > chunk_rows and (n != 2 * chunk_rows or start % chunk_rows != 0 or start + n > replay)) return error.BadChunk;
         const e = &m.eng;
         const c = e.c;
         const ch = &m.ch;
@@ -598,6 +631,11 @@ pub const Model = struct {
         const pt = m.ptimer;
         if (pt) |t| try t.mark(m.stream, .start);
         try prompt.begin(e, ch, m.ids64[0..n], start, m.host_pos);
+        ch.sub_rows = if (n > chunk_rows) chunk_rows else 0;
+        ch.sp = null;
+        if (m.sp_rows) if (m.two) |t| if (prompt.spFits(n, start, replay, ch.spans.len)) {
+            ch.sp = .{ .g = t.r + 2 * t.p, .q = n / 4 };
+        };
         if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
         if (pt) |t| try t.mark(m.stream, .embed);
         const taps = m.dr != null;
@@ -651,7 +689,7 @@ pub const Model = struct {
                         ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
                 } else if (m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
                     // the next chunk's rows while this one's layers run
-                    const nn = @min(chunk_rows, m.fill_seq.len - start - n);
+                    const nn = passRows(m.pass_rows, start + n, m.fill_seq.len, replay);
                     eh.ahead_start = start + n;
                     eh.ahead_n = nn;
                     eh.ahead_ready = .{ false, false };
@@ -806,3 +844,28 @@ pub const Model = struct {
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
     }
 };
+
+test "prompt passes: two chunks where both end by the replay, else one chunk; 2,048 as before" {
+    const c = chunk_rows;
+    // the served pass: one chunk, the last shorter
+    try std.testing.expectEqual(@as(usize, c), passRows(c, 0, 10 * c, 9 * c));
+    try std.testing.expectEqual(@as(usize, 100), passRows(c, 9 * c, 9 * c + 100, 9 * c - 28));
+    // 4,096: two chunks while both end at or before the replay
+    try std.testing.expectEqual(@as(usize, 2 * c), passRows(2 * c, 0, 8192, 8064));
+    try std.testing.expectEqual(@as(usize, c), passRows(2 * c, 4096, 8192, 8064)); // 8,192 is past the replay
+    try std.testing.expectEqual(@as(usize, 2 * c), passRows(2 * c, 4 * c, 6 * c + 128, 6 * c)); // ends exactly at it
+    try std.testing.expectEqual(@as(usize, c), passRows(2 * c, c, 2 * c + 50, 2 * c - 78)); // the decoder's chunk alone
+    // every pass starts at a chunk end, and the passes cover the prompt as the 2,048-row chunks do, merged in pairs
+    for ([_]usize{ 1, 2047, 2048, 2049, 4096, 4224, 6143, 8192, 32768, 146421, 156941 }) |len| {
+        const replay = len -| 128;
+        var start: usize = 0;
+        while (start < len) {
+            const n = passRows(2 * c, start, len, replay);
+            try std.testing.expect(start % c == 0);
+            try std.testing.expect(n == 2 * c or n == passRows(c, start, len, replay));
+            if (n > c) try std.testing.expect(start + n <= replay);
+            start += n;
+        }
+        try std.testing.expectEqual(len, start);
+    }
+}

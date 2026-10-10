@@ -52,4 +52,24 @@ pub const Comm = struct {
         try c.lib.check(s, "ncclSend");
         try c.lib.check(r, "ncclRecv");
     }
+
+    /// One side of a point-to-point transfer: `count` elements at `ptr` to or from rank `peer`.
+    pub const P2p = struct { ptr: u64, count: usize, peer: u32 };
+
+    /// Every send and receive in one NCCL group (all-to-all-v by point to point): the same bytes as each pair's
+    /// exchange, in one launch. Each rank must post the matching receive of every send.
+    pub fn sendRecv(c: Comm, sends: []const P2p, recvs: []const P2p, dtype: nccl.DataType, stream: cuda.Stream) !void {
+        try c.lib.check(c.lib.api.ncclGroupStart(), "ncclGroupStart");
+        var first: nccl.Result = 0;
+        for (sends) |x| {
+            const s = c.lib.api.ncclSend(x.ptr, x.count, dtype, @intCast(x.peer), c.comm, stream.handle);
+            if (first == 0) first = s;
+        }
+        for (recvs) |x| {
+            const r = c.lib.api.ncclRecv(x.ptr, x.count, dtype, @intCast(x.peer), c.comm, stream.handle);
+            if (first == 0) first = r;
+        }
+        try c.lib.check(c.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+        try c.lib.check(first, "ncclSend/ncclRecv");
+    }
 };

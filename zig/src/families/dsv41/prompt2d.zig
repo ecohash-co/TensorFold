@@ -403,12 +403,12 @@ pub fn ownerCopies(me: usize, n: usize, w: [2]usize, esize: usize) [4]OwnerCopy 
 
 test "toOwners: every owner's rows of quarters' [2, n, D], from the bytes the four nodes send" {
     // four nodes' parts of two TP2 ranks' partials, uneven pair widths, as bytes (esize 4)
-    const n = 8;
-    const q = n / 4;
+    const n: usize = 8;
+    const q: usize = n / 4;
     const w = [2]usize{ 5, 3 };
-    const es = 4;
-    const dw = w[0] + w[1];
-    const wmax = @max(w[0], w[1]);
+    const es: usize = 4;
+    const dw: usize = w[0] + w[1];
+    const wmax: usize = @max(w[0], w[1]);
     // partial[r][row][col]: a distinct u32 per entry
     var partial: [2][n][dw]u32 = undefined;
     for (0..2) |r| for (0..n) |i| for (0..dw) |j| {

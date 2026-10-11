@@ -20,6 +20,11 @@
 //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
 //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
 //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
+//!   TF_DS_ENGRAM_PREFETCH=<depth>[,scales]      (stage ZE2; needs TF_DS_ENGRAM_AIO=1) a prompt's Engram rows read by
+//!                                               a reader of their own up to depth (1-32, or prompt = 32) chunks ahead
+//!                                               of the chunk the GPU is on, on an AIO ring of its own; scales: the
+//!                                               tables' scale rows in RAM (~6 GiB), the drive reads the weight rows
+//!                                               alone (engram_pf.zig). Unset / "" / off / 0: the served read-ahead
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
 //!   TF_DS_SERVED_K=all|solo                     a stream verifies at most the served lane's choice of drafts (its
 //!                                               round table and draft ms): at any streams, or one stream alone
@@ -212,6 +217,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
         error.BadWindow => "TF_DS_WINDOW: the streams' shared positions, at least --context",
+        error.BadEngramPrefetch => "TF_DS_ENGRAM_PREFETCH: a depth 1 .. 32 or prompt, optionally then ,scales (e.g. 2 or 2,scales); unset / off: the served read-ahead",
+        error.EngramPrefetchNeedsAio => "TF_DS_ENGRAM_PREFETCH reads by Linux AIO: set TF_DS_ENGRAM_AIO=1 (followers: --aio 1)",
+        error.EngramPrefetchWithOverlap => "TF_DS_ENGRAM_PREFETCH does not run with TF_DS_PROMPT_OVERLAP (its passes read their own rows ahead)",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",

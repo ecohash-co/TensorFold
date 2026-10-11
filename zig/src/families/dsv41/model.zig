@@ -17,6 +17,7 @@ const draft = @import("draft.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
+const engram_pf = @import("engram_pf.zig");
 const exl3_prefill = @import("exl3_prefill.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
@@ -279,6 +280,7 @@ pub const Model = struct {
     aio: ?*engram_aio.Aio = null,
     paio: ?*engram_aio.Aio = null, // the prompt chunks' Engram reads, on a ring of their own
     eh: ?prompt.EngramHost = null,
+    epf: ?*engram_pf.Prefetch = null, // TF_DS_ENGRAM_PREFETCH: a prompt's Engram rows read chunks ahead (engram_pf.zig)
     host_pos: []i64,
     ids64: []i64,
     vocab: usize,
@@ -400,6 +402,13 @@ pub const Model = struct {
         const attn_lv = try promptAttn(); // (likewise)
         if (attn_lv.sp() and sp.pair == null) return error.AttnNeedsTheFourNodeSplit;
         if (attn_lv.any() and promptOverlap()) return error.AttnWithOverlap;
+        // TF_DS_ENGRAM_PREFETCH (stage ZE2; likewise): a prompt's Engram rows by a reader of their own, chunks ahead,
+        // on an AIO ring of its own (so it needs the served --aio 1); not with the overlapped passes (their read-ahead)
+        const epf_set = try engram_pf.fromEnv();
+        if (epf_set.on()) {
+            if (promptOverlap()) return error.EngramPrefetchWithOverlap;
+            if (!o.engram_aio) return error.EngramPrefetchNeedsAio;
+        }
         m.w = try weights.load(gpa, d, .{ .cache = .{ .file = m.cache_file, .index = &m.ix, .io = io } }, c.*, sp, o.drafts);
         errdefer m.w.deinit();
         if (o.drafts and m.w.dspark == null) return error.NoDrafter;
@@ -614,6 +623,16 @@ pub const Model = struct {
                 m.paio = try engram_aio.Aio.init(gpa, io, 4096);
                 m.eh.?.paio = m.paio;
             }
+            if (epf_set.on()) {
+                // its own ring of the prompt ring's 4,096 slots; with scales the tables' scale rows in RAM
+                const eh = &m.eh.?;
+                const t0 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+                m.epf = try engram_pf.Prefetch.init(gpa, io, c, eh.hasher, &m.tables.?, eh.lo, eh.hi, m.pass_rows, chunk_rows, epf_set, 4096);
+                eh.pf = m.epf;
+                const secs = @as(f64, @floatFromInt(std.Io.Timestamp.now(io, .awake).nanoseconds - t0)) / 1e9;
+                var nb: [32]u8 = undefined;
+                std.log.info("TF_DS_ENGRAM_PREFETCH={s}: prompt Engram rows read up to {d} chunks ahead by a reader of their own ({d} MiB held, {d:.1} s to set up)", .{ epf_set.names(&nb), epf_set.depth, m.epf.?.bytes() >> 20, secs });
+            }
         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
 
         // a vision checkpoint's image routing bias (without it a prompt with images is refused; text runs as ever)
@@ -638,6 +657,11 @@ pub const Model = struct {
 
     pub fn close(m: *Model) void {
         m.joinAhead();
+        if (m.epf) |p| {
+            p.deinit();
+            m.epf = null;
+            if (m.eh) |*eh| eh.pf = null;
+        }
         m.stream.synchronize() catch {};
         if (m.img_buf) |*b| b.free();
         m.spans.deinit(m.gpa);
@@ -756,6 +780,8 @@ pub const Model = struct {
     pub fn joinAhead(m: *Model) void {
         if (m.ahead) |th| th.join();
         m.ahead = null;
+        // TF_DS_ENGRAM_PREFETCH: the reader's plan dropped (a chunk it is on cancelled and waited for)
+        if (m.epf) |p| p.stop();
     }
 
     /// A kept prompt state's own bytes (the prompt cache's snapshots; the compressed plane stays in the stream's
@@ -922,7 +948,12 @@ pub const Model = struct {
         var ahead: ?std.Thread = m.ahead;
         m.ahead = null;
         defer if (ahead) |th| th.join();
-        if (m.eh) |*eh| {
+        if (m.epf) |pf| {
+            // TF_DS_ENGRAM_PREFETCH: the reader's plan has this chunk (or restarts at it), the chunks before it are
+            // given back, and it reads on up to its depth past this chunk; no `ahead` thread
+            const full = if (m.fill_seq.ptr == seq.ptr and m.fill_seq.len >= seq.len) m.fill_seq else seq;
+            pf.begin(full, start, n, replay);
+        } else if (m.eh) |*eh| {
             if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
                 ahead.?.join();
                 ahead = null;
@@ -966,7 +997,9 @@ pub const Model = struct {
                 }
                 const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
                 const ne = @min(2, c.engram_layers.slice().len);
-                if (j + 1 < ne) {
+                if (m.epf != null) {
+                    // TF_DS_ENGRAM_PREFETCH: the reader has the next layer's and the next chunks' rows in hand
+                } else if (j + 1 < ne) {
                     if (!eh.ahead_ready[j + 1])
                         ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
                 } else if (m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {

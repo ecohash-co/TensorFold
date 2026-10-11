@@ -133,9 +133,11 @@ pub const Aio = struct {
     }
 
     /// The submission (`mutex` held): rows `ids` of table `t`, a weight then a scale read each, copied into out_w /
-    /// out_s as they complete when given (null: a touch). Returns the batch id.
-    fn submitLocked(a: *Aio, t: engram_io.Table, ids: []const i64, out_w: ?[]u8, out_s: ?[]u8) !u64 {
-        const reads = 2 * ids.len;
+    /// out_s as they complete when given (null: a touch). Returns the batch id. `scales` false (startW, stage ZE2's
+    /// prefetch with the scales in RAM): the weight reads alone, one a row (out_s unused).
+    fn submitLocked(a: *Aio, t: engram_io.Table, ids: []const i64, out_w: ?[]u8, out_s: ?[]u8, scales: bool) !u64 {
+        const per_row: usize = if (scales) 2 else 1;
+        const reads = per_row * ids.len;
         if (reads > a.slots or reads >= 1 << 20) return error.TooManyRows;
         if (t.row_w + block > slot or t.row_s + block > slot) return error.RowTooWide;
         const fd_w = if (t.fd_wd >= 0) t.fd_wd else t.fd_w;
@@ -171,8 +173,8 @@ pub const Aio = struct {
         const ptrs = try a.gpa.alloc(*Iocb, reads);
         defer a.gpa.free(ptrs);
         for (0..reads) |j| {
-            const i = j >> 1;
-            const sc = j & 1 == 1;
+            const i = if (scales) j >> 1 else j;
+            const sc = scales and j & 1 == 1;
             const rb = if (sc) t.row_s else t.row_w;
             const row: u64 = @intCast(ids[i]);
             if (row >= t.rows) return error.RowOutOfRange;
@@ -224,7 +226,16 @@ pub const Aio = struct {
         if (out_w.len < ids.len * t.row_w or out_s.len < ids.len * t.row_s) return error.BadSize;
         a.mutex.lockUncancelable(a.io);
         defer a.mutex.unlock(a.io);
-        return a.submitLocked(t, ids, out_w, out_s);
+        return a.submitLocked(t, ids, out_w, out_s, true);
+    }
+
+    /// The weight rows alone of `ids` (one read a row, landing in out_w [ids.len, row_w] as they complete; keep it
+    /// alive until `wait` returns): stage ZE2's prompt prefetch, whose scale rows come from RAM. Returns the batch id.
+    pub fn startW(a: *Aio, t: engram_io.Table, ids: []const i64, out_w: []u8) !u64 {
+        if (out_w.len < ids.len * t.row_w) return error.BadSize;
+        a.mutex.lockUncancelable(a.io);
+        defer a.mutex.unlock(a.io);
+        return a.submitLocked(t, ids, out_w, null, false);
     }
 
     /// A touch of rows `ids`: their reads submitted, nothing copied, nobody waits (the lane hands these to a thread of
@@ -232,7 +243,7 @@ pub const Aio = struct {
     pub fn touch(a: *Aio, t: engram_io.Table, ids: []const i64) !void {
         a.mutex.lockUncancelable(a.io);
         defer a.mutex.unlock(a.io);
-        _ = try a.submitLocked(t, ids, null, null);
+        _ = try a.submitLocked(t, ids, null, null, true);
     }
 
     /// Reap (polling) until batch `id`'s rows are all in; error.ReadFailed when one failed. A batch is waited for once.
@@ -300,6 +311,21 @@ test "AIO rows equal the pool's, across a ring that wraps" {
         try aio.wait(id);
         try std.testing.expectEqualSlices(u8, &want_w, &got_w);
         try std.testing.expectEqualSlices(u8, &want_s, &got_s);
+    }
+    // the weight rows alone (startW): the same bytes, the scales untouched
+    {
+        var ids: [8]i64 = undefined;
+        for (&ids) |*x| x.* = prng.random().intRangeLessThan(i64, 0, rows);
+        var want_w: [8 * 100]u8 = undefined;
+        var want_s: [8 * 3]u8 = undefined;
+        try pool.gather(tab, &ids, &want_w, &want_s);
+        var got_w: [8 * 100]u8 = @splat(0);
+        const id = try aio.startW(tab, &ids, &got_w);
+        try aio.wait(id);
+        try std.testing.expectEqualSlices(u8, &want_w, &got_w);
+        const big: [17]i64 = @splat(0);
+        var big_out: [17 * 100]u8 = undefined;
+        try std.testing.expectError(error.TooManyRows, aio.startW(tab, &big, &big_out));
     }
     var big_w: [9 * 100]u8 = undefined;
     var big_s: [9 * 3]u8 = undefined;

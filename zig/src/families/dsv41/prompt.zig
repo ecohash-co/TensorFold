@@ -30,6 +30,7 @@ const comm = @import("comm.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
+const engram_pf = @import("engram_pf.zig");
 const exact = @import("exact.zig");
 const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
@@ -1670,6 +1671,7 @@ pub const EngramHost = struct {
     rows: []u16, // bf16 [cap, (hi - lo) * head_dim]
     aio: ?*engram_aio.Aio = null, // a round's reads by Linux AIO on the tables' O_DIRECT descriptors (else the pool)
     paio: ?*engram_aio.Aio = null, // a prompt chunk's reads the same way, on a ring of its own (else the pool)
+    pf: ?*engram_pf.Prefetch = null, // TF_DS_ENGRAM_PREFETCH: a prompt's rows from its reader (null: as served)
     // the rounds' Engram host time (ns, summed; a profile reads it): hashing, the table reads, the decode, the upload
     io: ?std.Io = null,
     t_hash: u64 = 0,
@@ -1794,8 +1796,12 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     // the rows read ahead (fillChunk's thread) when they are this chunk's, else read here
     var rows: []u16 = eh.rows;
     // (a read-ahead of a whole pass serves each of its chunks: their rows from the chunk's offset in it; it is used up
-    // with the pass's last row)
-    if (l < 2 and eh.ahead_ready[l] and ch.start >= eh.ahead_start and ch.start + n <= eh.ahead_start + eh.ahead_n) {
+    // with the pass's last row). TF_DS_ENGRAM_PREFETCH: the prefetch reader's rows of this chunk (the same rows, read
+    // earlier), waited for here when it is behind; none (a chunk it has not planned): read here as below.
+    const pre: ?[]u16 = if (eh.pf) |pf| try pf.take(l, ch.start, n) else null;
+    if (pre) |r| {
+        rows = r;
+    } else if (l < 2 and eh.ahead_ready[l] and ch.start >= eh.ahead_start and ch.start + n <= eh.ahead_start + eh.ahead_n) {
         rows = eh.ahead_rows[l][(ch.start - eh.ahead_start) * k * t.row_w ..];
         if (ch.start + n == eh.ahead_start + eh.ahead_n) eh.ahead_ready[l] = false;
     } else {
@@ -1866,7 +1872,10 @@ pub fn engramStage1(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, se
     const k = eh.hi - eh.lo;
     const m = n * k;
     var rows: []u16 = eh.rows;
-    if (l < 2 and eh.ahead_ready[l] and ch.start >= eh.ahead_start and ch.start + n <= eh.ahead_start + eh.ahead_n) {
+    const pre: ?[]u16 = if (eh.pf) |pf| try pf.take(l, ch.start, n) else null; // (as engramApply)
+    if (pre) |r| {
+        rows = r;
+    } else if (l < 2 and eh.ahead_ready[l] and ch.start >= eh.ahead_start and ch.start + n <= eh.ahead_start + eh.ahead_n) {
         rows = eh.ahead_rows[l][(ch.start - eh.ahead_start) * k * t.row_w ..];
         if (ch.start + n == eh.ahead_start + eh.ahead_n) eh.ahead_ready[l] = false;
     } else {

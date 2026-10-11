@@ -1489,7 +1489,9 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     // 2D chunks past the rings: the pair's sum then the pairs' bf16 halves (Two.engramSum), the same bits
     const psum = if (e.two) |two| two.rings == null or n >= 64 else false;
     if (psum) {
-        try e.two.?.engramSum(e, ch.ek, ch.ekg, ch.kv, n);
+        // TF_DS_PROMPT_ENGRAM=sp on an SP chunk: kv's owned rows alone (the gate below reads no other row of kv)
+        const two = e.two.?;
+        if (two.engram_sp and ch.sp != null) try two.engramSumSp(e, ch.ek, ch.ekg, ch.kv, ch.sp.?.owners()) else try two.engramSum(e, ch.ek, ch.ekg, ch.kv, n);
         if (prof) eh.p_x += lap(e, eh, &tq);
     } else {
         if (e.two) |two| try two.quarters(e, ch.ek, ch.ekg, n, two.ew, 4) else try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);

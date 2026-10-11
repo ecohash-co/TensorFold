@@ -120,6 +120,12 @@ pub const Two = struct {
     // TF_DS_PROMPT_SP=rows (model.spRows): catRank's NCCL path as a send / recv with the column partner (the only part
     // it uses) instead of an all-gather over the four; the same bytes in place
     p2p_cat: bool = false,
+    // TF_DS_PROMPT_ENGRAM=sp (model.promptEngram; SP chunks only): Engram's sum for the rows this node owns alone
+    // (engramSumSp), the only rows its gate reads
+    engram_sp: bool = false,
+    // TF_DS_PROMPT_A2A=shift (model.promptA2a): toOwners as three shift steps (send to g + k, receive from g - k), so
+    // no node receives from two peers at once; the same transfers
+    a2a_shift: bool = false,
 
     /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
@@ -169,6 +175,8 @@ pub const Two = struct {
         t.own = try a.take(round_rows * t.uw[pp] * 2);
         t.rings = null;
         t.p2p_cat = false;
+        t.engram_sp = false;
+        t.a2a_shift = false;
         return t;
     }
 
@@ -290,17 +298,31 @@ pub const Two = struct {
         if (!o.valid()) return error.BadOwnerRows;
         const me = t.r + 2 * t.p;
         if (o.rows(3) * @max(w[0], w[1]) * esize > t.part_bytes) return error.PartTooBig;
-        var sends: [3]Comm.P2p = undefined;
-        var recvs: [3]Comm.P2p = undefined;
-        var k: usize = 0;
-        for (0..4) |h| {
-            if (h == me) continue;
-            const x = ownerExchange(me, h, o, w, esize);
-            sends[k] = .{ .ptr = src + x.send_off, .count = x.send_bytes, .peer = @intCast(h) };
-            recvs[k] = .{ .ptr = t.parts + x.recv_off, .count = x.recv_bytes, .peer = @intCast(h) };
-            k += 1;
+        if (t.a2a_shift) {
+            // TF_DS_PROMPT_A2A=shift: step k (1..3) sends to me + k and receives from me - k, one NCCL group a step and
+            // the same order on every node, so each step is a permutation (no incast at any node's port); each
+            // transfer is the one the single group posts (ownerExchange), only their timing differs
+            for (1..4) |k| {
+                const st = shiftStep(me, k);
+                const xs = ownerExchange(me, st.to, o, w, esize);
+                const xr = ownerExchange(me, st.from, o, w, esize);
+                const s1 = [1]Comm.P2p{.{ .ptr = src + xs.send_off, .count = xs.send_bytes, .peer = @intCast(st.to) }};
+                const r1 = [1]Comm.P2p{.{ .ptr = t.parts + xr.recv_off, .count = xr.recv_bytes, .peer = @intCast(st.from) }};
+                try e.comm.sendRecv(&s1, &r1, .u8, e.s);
+            }
+        } else {
+            var sends: [3]Comm.P2p = undefined;
+            var recvs: [3]Comm.P2p = undefined;
+            var k: usize = 0;
+            for (0..4) |h| {
+                if (h == me) continue;
+                const x = ownerExchange(me, h, o, w, esize);
+                sends[k] = .{ .ptr = src + x.send_off, .count = x.send_bytes, .peer = @intCast(h) };
+                recvs[k] = .{ .ptr = t.parts + x.recv_off, .count = x.recv_bytes, .peer = @intCast(h) };
+                k += 1;
+            }
+            try e.comm.sendRecv(&sends, &recvs, .u8, e.s);
         }
-        try e.comm.sendRecv(&sends, &recvs, .u8, e.s);
         for (ownerCopies(me, o, w, esize)) |cp| {
             const base = if (cp.from == me) src else t.parts;
             try e.ops.copyRows(e.s, base + cp.src_off, cp.src_ld, dst + cp.dst_off, cp.dst_ld, cp.bytes, o.rows(me));
@@ -385,6 +407,35 @@ pub const Two = struct {
         }
     }
 
+    /// engramSum for SP rows (TF_DS_PROMPT_ENGRAM=sp): kv's rows that this node owns, [o.r0(g), + o.rows(g)) of
+    /// [n, ew0 + ew1] bf16, the only rows its Engram gate reads (prompt.engramApply on the mixes' view). The same two
+    /// steps on fewer rows (engramPlan): the row partner's fp32 columns of this node's rows and of its column partner's
+    /// rows (the row partner gets the other half), the same add2Bf16 (this node's operand first, as engramSum), then the
+    /// column partner's bf16 sums of this node's rows. Every element of kv's owned rows is the add engramSum makes of
+    /// the same two fp32 words; nothing else moves. Bytes in a chunk row: ~(ew·4 / 2 + ew·2 / 4) against ew·4 + ew·2.
+    pub fn engramSumSp(t: *const Two, e: *const prompt.Engine, src: u64, tmp: u64, kv: u64, o: Owners) !void {
+        if (!o.valid()) return error.BadOwnerRows;
+        const me = t.r + 2 * t.p;
+        const pl = engramPlan(me, o, t.ew);
+        // (within what engramSum's tmp holds for o.n rows: Chunk.ekg)
+        if (pl.tmp_bytes > o.n * (t.ew[t.p] * 6 + t.ew[1 - t.p] * 2)) return error.PartTooBig;
+        var s1: [2]Comm.P2p = undefined;
+        var r1: [2]Comm.P2p = undefined;
+        for (0..2) |j| {
+            s1[j] = .{ .ptr = src + pl.s1_send[j].off, .count = pl.s1_send[j].bytes, .peer = @intCast(pl.row_peer) };
+            r1[j] = .{ .ptr = tmp + pl.s1_recv[j].off, .count = pl.s1_recv[j].bytes, .peer = @intCast(pl.row_peer) };
+        }
+        try e.comm.sendRecv(&s1, &r1, .u8, e.s);
+        try prompt.pm(e, .comm);
+        for (pl.adds) |ad| try e.ops.add2Bf16(e.s, src + ad.mine, tmp + ad.other, tmp + ad.out, ad.count);
+        try prompt.pm(e, .engram);
+        const s2 = [1]Comm.P2p{.{ .ptr = tmp + pl.s2_send.off, .count = pl.s2_send.bytes, .peer = @intCast(pl.col_peer) }};
+        const r2 = [1]Comm.P2p{.{ .ptr = tmp + pl.s2_recv.off, .count = pl.s2_recv.bytes, .peer = @intCast(pl.col_peer) }};
+        try e.comm.sendRecv(&s2, &r2, .u8, e.s);
+        for (pl.copies) |cp| try e.ops.copyRows(e.s, tmp + cp.src_off, cp.src_ld, kv + cp.dst_off, cp.dst_ld, cp.bytes, cp.rows);
+        try prompt.pm(e, .comm);
+    }
+
     /// Engram's projection summed over the ranks from its column quarters (model.py esum): the gathered width.
     pub fn engramWidth(t: *const Two) usize {
         return t.ew[0] + t.ew[1];
@@ -454,6 +505,189 @@ pub fn ownerCopies(me: usize, o: Owners, w: [2]usize, esize: usize) [4]OwnerCopy
         };
     }
     return out;
+}
+
+/// TF_DS_PROMPT_A2A=shift's step k (1..3) on node me: it sends to me + k and receives from me - k (mod 4).
+pub const Shift = struct { to: usize, from: usize };
+
+pub fn shiftStep(me: usize, k: usize) Shift {
+    return .{ .to = (me + k) % 4, .from = (me + 4 - k) % 4 };
+}
+
+/// engramSumSp's transfers, adds and copies on node me (offsets in bytes: sends from src, receives / adds / copies in
+/// tmp, copies' destinations in kv). Areas of tmp: `other` fp32 [rows(me) + rows(mate), ew[p]] (the row partner's
+/// columns of me's rows, then of its column partner's: mate = me ^ 2), `half` bf16 of the same rows (the sums), `their`
+/// bf16 [rows(me), ew[1 - p]] (the column partner's sums of me's rows).
+pub const Seg = struct { off: usize, bytes: usize };
+pub const EngramAdd = struct { mine: usize, other: usize, out: usize, count: usize };
+pub const EngramCopy = struct { src_off: usize, src_ld: usize, dst_off: usize, dst_ld: usize, bytes: usize, rows: usize };
+pub const EngramPlan = struct {
+    row_peer: usize,
+    col_peer: usize,
+    s1_send: [2]Seg, // to the row partner: its rows, then its column partner's (fp32, this node's columns)
+    s1_recv: [2]Seg, // from it: me's rows, then mate's
+    adds: [2]EngramAdd, // me's rows, mate's: bf16(mine + the row partner's)
+    s2_send: Seg, // to the column partner: mate's sums
+    s2_recv: Seg, // from it: me's rows of the other pair's sums
+    copies: [2]EngramCopy, // into kv's rows of me: pair 0's columns, then pair 1's
+    tmp_bytes: usize,
+};
+
+pub fn engramPlan(me: usize, o: Owners, w: [2]usize) EngramPlan {
+    const p = me / 2;
+    const rp = me ^ 1;
+    const mate = me ^ 2;
+    const wp = w[p];
+    const wq = w[1 - p];
+    const row = (w[0] + w[1]) * 2;
+    const rm = o.rows(me);
+    const rt = o.rows(mate);
+    const other: usize = 0;
+    const half = std.mem.alignForward(usize, other + (rm + rt) * wp * 4, 256);
+    const their = std.mem.alignForward(usize, half + (rm + rt) * wp * 2, 256);
+    var pl: EngramPlan = undefined;
+    pl.row_peer = rp;
+    pl.col_peer = mate;
+    pl.s1_send = .{
+        .{ .off = o.r0(rp) * wp * 4, .bytes = o.rows(rp) * wp * 4 },
+        .{ .off = o.r0(rp ^ 2) * wp * 4, .bytes = o.rows(rp ^ 2) * wp * 4 },
+    };
+    pl.s1_recv = .{ .{ .off = other, .bytes = rm * wp * 4 }, .{ .off = other + rm * wp * 4, .bytes = rt * wp * 4 } };
+    pl.adds = .{
+        .{ .mine = o.r0(me) * wp * 4, .other = other, .out = half, .count = rm * wp },
+        .{ .mine = o.r0(mate) * wp * 4, .other = other + rm * wp * 4, .out = half + rm * wp * 2, .count = rt * wp },
+    };
+    pl.s2_send = .{ .off = half + rm * wp * 2, .bytes = rt * wp * 2 };
+    pl.s2_recv = .{ .off = their, .bytes = rm * wq * 2 };
+    for (0..2) |pg| {
+        pl.copies[pg] = .{
+            .src_off = if (pg == p) half else their,
+            .src_ld = w[pg] * 2,
+            .dst_off = o.r0(me) * row + pg * w[0] * 2,
+            .dst_ld = row,
+            .bytes = w[pg] * 2,
+            .rows = rm,
+        };
+    }
+    pl.tmp_bytes = their + rm * wq * 2;
+    return pl;
+}
+
+/// fp32 -> bf16, round to nearest even (__float2bfloat16_rn on finite values), for the host tests.
+fn bf16rn(x: f32) u16 {
+    const b: u32 = @bitCast(x);
+    const lsb = (b >> 16) & 1;
+    return @intCast((b +% (0x7fff + lsb)) >> 16);
+}
+
+test "TF_DS_PROMPT_A2A=shift: three permutation steps that post exactly toOwners' transfers" {
+    for (1..4) |k| {
+        var hit: [4]u8 = @splat(0);
+        for (0..4) |me| {
+            const st = shiftStep(me, k);
+            try std.testing.expect(st.to != me and st.from != me);
+            // the node me sends to receives from me in the same step
+            try std.testing.expectEqual(me, shiftStep(st.to, k).from);
+            hit[st.to] += 1;
+        }
+        // a permutation: every node receives from exactly one peer a step
+        for (hit) |x| try std.testing.expectEqual(@as(u8, 1), x);
+    }
+    // over the three steps each node sends to and receives from every other node once
+    for (0..4) |me| {
+        var to: [4]u8 = @splat(0);
+        var from: [4]u8 = @splat(0);
+        for (1..4) |k| {
+            to[shiftStep(me, k).to] += 1;
+            from[shiftStep(me, k).from] += 1;
+        }
+        for (0..4) |h| {
+            try std.testing.expectEqual(@as(u8, if (h == me) 0 else 1), to[h]);
+            try std.testing.expectEqual(@as(u8, if (h == me) 0 else 1), from[h]);
+        }
+    }
+}
+
+test "TF_DS_PROMPT_ENGRAM=sp: each owner's rows of kv equal engramSum's, from the bytes the four nodes send" {
+    // four nodes' fp32 parts of the two ranks' Engram projections (rank g % 2, pair g / 2's columns, every row); the
+    // reference kv = bf16(p0 + p1) of every element (engramSum: two operands, the same bits in either order)
+    inline for (.{ Owners{ .q = 2, .n = 8 }, Owners{ .q = 2, .n = 11 }, Owners{ .q = 3, .n = 12 } }) |o| {
+        const n: usize = o.n;
+        const w = [2]usize{ 5, 3 };
+        const dw: usize = w[0] + w[1];
+        var prng = std.Random.DefaultPrng.init(17 + n);
+        const rnd = prng.random();
+        var proj: [2][n][dw]f32 = undefined;
+        for (0..2) |r| for (0..n) |i| for (0..dw) |j| {
+            proj[r][i][j] = (rnd.float(f32) - 0.5) * std.math.pow(f32, 2, @floatFromInt(rnd.intRangeAtMost(i32, -20, 20)));
+        };
+        var ref: [n][dw]u16 = undefined;
+        for (0..n) |i| for (0..dw) |j| {
+            ref[i][j] = bf16rn(proj[0][i][j] + proj[1][i][j]);
+        };
+        // node g's src [n, w[p]] fp32 as bytes
+        var src: [4][n * 5]f32 = undefined;
+        for (0..4) |g| for (0..n) |i| for (0..w[g / 2]) |j| {
+            src[g][i * w[g / 2] + j] = proj[g % 2][i][(g / 2) * w[0] + j];
+        };
+        // every node's tmp, then the two steps as the four nodes run them
+        var tmp: [4][4096]u8 align(4) = undefined;
+        for (&tmp) |*x| @memset(x, 0xAB);
+        var pls: [4]EngramPlan = undefined;
+        for (0..4) |g| {
+            pls[g] = engramPlan(g, o, w);
+            try std.testing.expect(pls[g].tmp_bytes <= 4096);
+        }
+        // step 1: g's receive j from its row partner = the partner's send j (the same sizes, in the posted order)
+        for (0..4) |g| {
+            const rp = pls[g].row_peer;
+            try std.testing.expectEqual(g, pls[rp].row_peer);
+            for (0..2) |j| {
+                const s = pls[rp].s1_send[j];
+                const r = pls[g].s1_recv[j];
+                try std.testing.expectEqual(s.bytes, r.bytes);
+                const sb = std.mem.sliceAsBytes(&src[rp]);
+                @memcpy(tmp[g][r.off..][0..r.bytes], sb[s.off..][0..s.bytes]);
+            }
+        }
+        // the adds (add2Bf16: __float2bfloat16_rn(__fadd_rn(mine, other)), elementwise)
+        for (0..4) |g| {
+            const sb = std.mem.sliceAsBytes(&src[g]);
+            for (pls[g].adds) |ad| {
+                for (0..ad.count) |i| {
+                    const a = std.mem.bytesToValue(f32, sb[ad.mine + 4 * i ..][0..4]);
+                    const b = std.mem.bytesToValue(f32, tmp[g][ad.other + 4 * i ..][0..4]);
+                    std.mem.writeInt(u16, tmp[g][ad.out + 2 * i ..][0..2], bf16rn(a + b), .little);
+                }
+            }
+        }
+        // step 2: from the column partner (copied from a snapshot: every node sends before any receives)
+        const snap = tmp;
+        for (0..4) |g| {
+            const cp = pls[g].col_peer;
+            try std.testing.expectEqual(g, pls[cp].col_peer);
+            const s = pls[cp].s2_send;
+            const r = pls[g].s2_recv;
+            try std.testing.expectEqual(s.bytes, r.bytes);
+            @memcpy(tmp[g][r.off..][0..r.bytes], snap[cp][s.off..][0..s.bytes]);
+        }
+        // the copies into kv, and kv's owned rows against the reference
+        for (0..4) |g| {
+            var kv: [n * dw]u16 = @splat(0xffff);
+            const kb = std.mem.sliceAsBytes(&kv);
+            for (pls[g].copies) |cp| for (0..cp.rows) |i| {
+                @memcpy(kb[cp.dst_off + i * cp.dst_ld ..][0..cp.bytes], tmp[g][cp.src_off + i * cp.src_ld ..][0..cp.bytes]);
+            };
+            for (0..o.rows(g)) |i| for (0..dw) |j| {
+                try std.testing.expectEqual(ref[o.r0(g) + i][j], kv[(o.r0(g) + i) * dw + j]);
+            };
+        }
+        // bytes a node receives against engramSum's (n rows of its fp32 columns, then n of the other pair's bf16)
+        for (0..4) |g| {
+            const got = pls[g].s1_recv[0].bytes + pls[g].s1_recv[1].bytes + pls[g].s2_recv.bytes;
+            try std.testing.expect(got < n * w[g / 2] * 4 + n * w[1 - g / 2] * 2);
+        }
+    }
 }
 
 test "toOwners: every owner's rows of quarters' [2, n, D], from the bytes the four nodes send (even and rows2's split)" {

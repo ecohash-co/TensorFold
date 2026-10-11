@@ -30,6 +30,10 @@
 //!   TF_DS_PROMPT_SP=rows2                       rows, and also the chunk reaching the replay (its encoder layers; its
 //!                                               rows past the replay whole again at the cut) and any n >= 256
 //!                                               (prompt.spFits2, prompt2d.Owners)
+//!   TF_DS_PROMPT_ENGRAM=sp                      with SP rows: an SP chunk's Engram sums for each node's owned rows
+//!                                               alone (prompt2d.Two.engramSumSp; the same adds, ~58% fewer bytes)
+//!   TF_DS_PROMPT_A2A=shift                      with SP rows: toOwners in three shift steps (no incast; the same
+//!                                               transfers, prompt2d.shiftStep)
 //!   TF_DS_PROMPT_PROF=1                         each prompt chunk's GPU time by phase, a JSON line a chunk on stderr
 //!                                               (pprof.zig; one synchronize a chunk)
 //!   TF_DS_PROMPT_OVERLAP=1                      world 4 with TF_DS_PROMPT_CHUNK=4096: a pass's two chunks one layer

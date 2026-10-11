@@ -61,6 +61,28 @@ pub fn spRows() bool {
     return spMode() != .off;
 }
 
+/// TF_DS_PROMPT_ENGRAM=sp (four-node split, with SP rows): on an SP chunk an Engram layer's sum is made for the rows
+/// each node owns alone (Two.engramSumSp), the only rows its gate reads; the same adds of the same words. Unset / ""
+/// / "all": every row (Two.engramSum), as served.
+pub fn promptEngram() !bool {
+    const v = std.c.getenv("TF_DS_PROMPT_ENGRAM") orelse return false;
+    const s = std.mem.span(v);
+    if (s.len == 0 or std.mem.eql(u8, s, "all")) return false;
+    if (std.mem.eql(u8, s, "sp")) return true;
+    return error.BadPromptEngram;
+}
+
+/// TF_DS_PROMPT_A2A=shift (four-node split, with SP rows): toOwners' all-to-all as three shift steps, one NCCL group
+/// each (send to g + k, receive from g - k), so no node's port takes two senders at once; the same transfers. Unset /
+/// "" / "group": one group of every send and receive, as served.
+pub fn promptA2a() !bool {
+    const v = std.c.getenv("TF_DS_PROMPT_A2A") orelse return false;
+    const s = std.mem.span(v);
+    if (s.len == 0 or std.mem.eql(u8, s, "group")) return false;
+    if (std.mem.eql(u8, s, "shift")) return true;
+    return error.BadPromptA2a;
+}
+
 /// TF_DS_PROMPT_OVERLAP=1 (four-node split, with TF_DS_PROMPT_CHUNK=4096): an encoder-only pass's two chunks run one
 /// layer apart, the second on a stream, buffer set and NCCL communicator of its own (Overlap), launched from this one
 /// thread in a fixed order, so one chunk's exchanges run under the other's kernels. Each chunk runs the 2,048-row
@@ -381,6 +403,11 @@ pub const Model = struct {
         if (sp.pair != null) {
             m.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, m.pass_rows);
             m.two.?.p2p_cat = m.sp_rows;
+            // TF_DS_PROMPT_ENGRAM / TF_DS_PROMPT_A2A: only SP chunks take them (nothing changes without SP rows)
+            m.two.?.engram_sp = try promptEngram();
+            m.two.?.a2a_shift = try promptA2a();
+            if (m.two.?.engram_sp) std.log.info("TF_DS_PROMPT_ENGRAM=sp: Engram sums on owned rows ({s})", .{if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset"});
+            if (m.two.?.a2a_shift) std.log.info("TF_DS_PROMPT_A2A=shift: toOwners in three shift steps ({s})", .{if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset"});
             if (o.rdma_devices) |devs| {
                 const image: []const u8 = if (o.rdma_kernels) |path|
                     try std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 26), .@"16", null)
@@ -438,6 +465,8 @@ pub const Model = struct {
             comm2 = null;
             ov.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, chunk_rows);
             ov.two.p2p_cat = m.sp_rows;
+            ov.two.engram_sp = m.two.?.engram_sp;
+            ov.two.a2a_shift = m.two.?.a2a_shift;
             ov.eng = m.eng;
             ov.eng.s = ov.stream;
             ov.eng.t.stream = ov.stream;

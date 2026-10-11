@@ -90,6 +90,16 @@ pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u6
         }, relax);
     }
     std.debug.assert(base == null);
+    return indexScoreRows(t, q, k, w, vis, n, out, keys, tmax, rows, ih, id);
+}
+
+/// index_score's prompt-chunk launch (_index_score_rows) whatever the row count: rows of a block of more than
+/// decode_rows rows (TF_DS_PROMPT_ATTN=isplit: a block's rows one node owns; each row's scores are its own, one row a
+/// program). rows >= 2 (the kit has no rows == 1 specialization).
+pub fn indexScoreRows(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u64, keys: bool, tmax: ?u64, rows: usize, ih: usize, id: usize) !void {
+    const nt = tri.cdiv(n, tile);
+    const ot: []const u8 = if (keys) "*i64" else "*fp32";
+    const tm = p("TMAX", if (tmax != null) "*i64" else ot, tmax orelse out);
     try t.run("_index_score_rows", .{ tri.cdiv(rows, idx_rb), nt, 1 }, &.{
         p("Q", "*bf16", q),    p("K", k.ty(), k.codes()), p("KS", k.ty(), k.scales()), p("Wt", "*bf16", w),
         p("VIS", "*i64", vis), p("OUT", ot, out),         int("n", n),                 int("rows", rows),
@@ -140,11 +150,16 @@ pub const TopK = struct {
 /// topk_select: keys int64 [R, n] (row stride ks) -> out [R, k] int64, the k largest keys' indices sorted, -1 past vis[r].
 pub fn topkSelect(t: Tri, keys: u64, ks: usize, k: usize, vis: u64, out: u64, top: TopK, rows: usize, n: usize) !void {
     // switch "topk_fused" (served on): one launch a row for power-of-two k <= n <= TOPK_FUSED_MAX, contiguous int64 keys
-    if (pow2(n) and pow2(k) and k <= n and n <= topk_fused_max and (ks == n or rows <= 1)) {
+    if (fusedSelect(n, k, ks, rows)) {
         return t.run("_topk_sel", .{ u(rows), 1, 1 }, &.{ p("KEYS", "*i64", keys), p("VIS", "*i64", vis), p("OUT", "*i64", out) }, &.{ ci("N", n), ci("KK", k), t.pdlConst() });
     }
     try top.run(top.ctx, t, keys, ks, rows, n, k, top.top);
     try t.run("_topk_finish", .{ u(rows), 1, 1 }, &.{ p("TOP", "*i64", top.top), p("VIS", "*i64", vis), p("OUT", "*i64", out) }, &.{ ci("KK", k), t.pdlConst() });
+}
+
+/// topk_select takes the fused selection (_topk_sel, switch "topk_fused") for these keys (else torch's top-k).
+pub fn fusedSelect(n: usize, k: usize, ks: usize, rows: usize) bool {
+    return pow2(n) and pow2(k) and k <= n and n <= topk_fused_max and (ks == n or rows <= 1);
 }
 
 /// prunes: topk_select_pruned searches tiles for rows of n keys (more than TOPK_FUSED_MAX keys and more than k tiles).

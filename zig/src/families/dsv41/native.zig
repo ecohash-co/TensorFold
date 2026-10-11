@@ -48,6 +48,11 @@
 //!   TF_DS_PROMPT_OVL=...,fxag                   (not in all) the FFN x all-gather as row-partner + column-partner
 //!                                               exchanges on the comm stream, this pair's 2,048-row router run under
 //!                                               the second (4,096-row passes)
+//!   TF_DS_PROMPT_ATTN=front,isplit|all          with SP rows: an SP chunk's attention without the work every node
+//!                                               repeated: the front (wq_a, wkv, q_norm) and the indexer (queries,
+//!                                               scores, top-k) on the owned rows, their outputs gathered (attn.zig);
+//!                                               with TF_DS_PROMPT_OVL, fronts qr / kv gather takes xags place on
+//!                                               its layers on the comm stream, in the same launch order (stage ZC2)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the

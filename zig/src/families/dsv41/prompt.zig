@@ -37,6 +37,7 @@ const prompt2d = @import("prompt2d.zig");
 const rdma = @import("rdma.zig");
 const pprof = @import("pprof.zig");
 const ovl = @import("ovl.zig");
+const attn = @import("attn.zig");
 
 /// The indexer's [rows, n_comp] keys a row block holds at most (model.py: rb * n_comp <= 2^26 / 4 past 16 rows).
 const key_elems: usize = 1 << 24;
@@ -132,6 +133,7 @@ pub const Engine = struct {
     x2: ?*const exl3_prompt.Kernels = null, // TF_DS_EXL3_PROMPT=v2: a 2D node's prompt-chunk expert GEMMs (exl3_prompt.zig)
     prof: ?*pprof.Prof = null, // TF_DS_PROMPT_PROF=1: the chunk's phase marks (set by fillChunk for the chunk alone)
     side: ?*ovl.Side = null, // TF_DS_PROMPT_OVL: the comm stream (set by fillChunk for an SP chunk alone; null: as served)
+    attn: ?*const attn.State = null, // TF_DS_PROMPT_ATTN (attn.zig): its levers; null: as served
 
     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.
@@ -800,6 +802,8 @@ pub fn attnMixesX(e: *const Engine, ch: *Chunk, li: usize, side_ok: bool) !void 
         try tri_basic.hcPre(e.t, v.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], v.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, v.x, v.pre_a, v.post, v.comb, ch.part, v.rows, c.hidden);
     }
     try pm(e, .mix);
+    // TF_DS_PROMPT_ATTN=front: no x all-gather (the attention gathers its front's outputs instead)
+    if (frontOn(e, ch, li)) return;
     if (side_ok) if (e.side) |sd| if (sd.lv.xag) if (ch.sp) |sp| if (ovl.ownFirst(sp.owners(), sp.g) != null) {
         // TF_DS_PROMPT_OVL=xag: the same all-gather (and rows2 tail) on the comm stream after this node's mixes
         const d = e.c.hidden;
@@ -950,6 +954,13 @@ pub fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: us
 /// (bf16 [window + RING_EXTRA, head_dim]). A compressed layer also attends to its kv source's latents the indexer picks
 /// (a kv source first compresses the chunk into them). `floor`: no window key before this position.
 pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, ring: u64, floor: usize, kv_done: bool) !void {
+    try attentionCore(e, ch, cs, sh, li, ring, floor, kv_done);
+    return attentionWoB(e, ch, li);
+}
+
+/// attention up to wo_a's output u (every launch attention makes before wo_b, in its order): the attention benchmark
+/// (tf-dsv41-attn-bench) times and compares it on one GPU.
+pub fn attentionCore(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, ring: u64, floor: usize, kv_done: bool) !void {
     const lay = e.w.layers[li];
     const c = e.c;
     const n = ch.n;
@@ -963,7 +974,9 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     // ring mode (a chunk of RING_EXTRA rows or fewer): the rows' keys into the ring first, the attention reads the ring
     const ring_mode = n <= ring_extra;
     // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to 128 rows
-    if (ch.xag_sent) {
+    if (frontOn(e, ch, li)) {
+        try frontSp(e, ch, lay);
+    } else if (ch.xag_sent) {
         // TF_DS_PROMPT_OVL=xag (attnMixesX sent x's all-gather on the comm stream): the row-local front on this
         // node's own rows (here already), then on the rest once the all-gather has landed; every launch the same
         // prompt GEMM / RMSNorm on fewer rows (ownFirst keeps each part above the GEMM's 128 rows)
@@ -1092,25 +1105,95 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         try grouped(e, ch, n, lay.wo_a[0..groups], xs[0..groups], lds[0..groups], outs[0..groups], oss[0..groups], dts[0..groups]);
     }
     try pm(e, .dense);
+}
+
+/// attention's wo_b of u to the partial pa (fp32).
+pub fn attentionWoB(e: *const Engine, ch: *Chunk, li: usize) !void {
+    const lay = e.w.layers[li];
     if (e.two) |t| return t.woB(e, ch, lay); // 2D: the column partner's groups first, then this pair's columns
-    try mm(e, ch, lay.wo_b, ch.u, uw, ch.pa, .fp32, c.hidden);
+    const uw = lay.groups * lay.wo_a[0].n;
+    try mm(e, ch, lay.wo_b, ch.u, uw, ch.pa, .fp32, e.c.hidden);
     try pm(e, .dense);
 }
 
 /// attention's row-local front on rows [r.r0, + r.rows) (TF_DS_PROMPT_OVL=xag): wq_a and wkv of x, q_norm, wq_b, the
 /// launches attention makes on every row, each on these rows (r.rows > 128: the prompt GEMM, as for the whole chunk).
 fn attnFront(e: *const Engine, ch: *Chunk, lay: weights.Layer, r: ovl.Range) !void {
+    const qn = lay.wq_a.n;
+    const qw = e.heads() * e.c.head_dim;
+    try frontRows(e, ch, lay, r);
+    try mmRows(e, ch, r.rows, lay.wq_b, ch.qr + r.r0 * qn * 2, qn, ch.q + r.r0 * qw * 2, .bf16, qw);
+    try pm(e, .dense);
+}
+
+/// wq_a and wkv of x, then q_norm, on rows [r.r0, + r.rows) (more than 128: the prompt GEMM, as for the whole chunk).
+fn frontRows(e: *const Engine, ch: *Chunk, lay: weights.Layer, r: ovl.Range) !void {
     const c = e.c;
     const hd = c.head_dim;
     const qn = lay.wq_a.n;
-    const qw = e.heads() * hd;
     if (r.rows <= ovl.gemm_min_rows) return error.RowPartTooSmall;
     try mmRows(e, ch, r.rows, lay.wq_a, ch.x + r.r0 * c.hidden * 2, c.hidden, ch.qa + r.r0 * qn * 2, .bf16, qn);
     try mmRows(e, ch, r.rows, lay.wkv, ch.x + r.r0 * c.hidden * 2, c.hidden, ch.y + r.r0 * hd * 2, .bf16, hd);
     try pm(e, .dense);
     try tri_basic.rmsnorm(e.t, ch.qa + r.r0 * qn * 2, qn, lay.q_norm, ch.qr + r.r0 * qn * 2, qn, c.eps, r.rows, qn);
     try pm(e, .mix);
-    try mmRows(e, ch, r.rows, lay.wq_b, ch.qr + r.r0 * qn * 2, qn, ch.q + r.r0 * qw * 2, .bf16, qw);
+}
+
+/// TF_DS_PROMPT_ATTN's levers on layer li of the chunk: an SP chunk's encoder layer whose four owners each have more
+/// than the prompt GEMM's 128 rows (the same answer on every rank: it depends on n alone); none otherwise.
+pub fn attnLevers(e: *const Engine, ch: *const Chunk, li: usize) attn.Levers {
+    const st = e.attn orelse return .{};
+    const sp = ch.sp orelse return .{};
+    if (li >= e.c.layers / 2) return .{};
+    if (!attn.ownersFit(sp.owners())) return .{};
+    return st.lv;
+}
+
+/// TF_DS_PROMPT_ATTN=front on layer li: its attention reads x only for its front (no kv source, no indexer).
+pub fn frontOn(e: *const Engine, ch: *const Chunk, li: usize) bool {
+    const lay = e.w.layers[li];
+    return attnLevers(e, ch, li).front and lay.comp_wkv == null and lay.idx_wq_b == null;
+}
+
+/// Rows [r0(me), + rows(me)) of `buf` (rows of `row` bytes) from every owner to every node, in place: the equal parts
+/// by one all-gather, node 3's rows past them (rows2) by send / recv, on stream `s`.
+fn gatherOwn(e: *const Engine, sp: Sp, buf: u64, row: usize, s: cuda.Stream) !void {
+    try e.comm.allGather(buf + sp.g * sp.q * row, buf, sp.q * row, .u8, s);
+    try spTail(e, sp, buf, row, s);
+}
+
+/// TF_DS_PROMPT_ATTN=front: wq_a, wkv and q_norm on this node's rows, then qr and kv of every owner's rows gathered
+/// (on the OVL comm stream when there is one) while wq_b runs on this node's rows, then wq_b on the rest. With
+/// emulate (the benchmark), every owner's rows one after another, no gather.
+fn frontSp(e: *const Engine, ch: *Chunk, lay: weights.Layer) !void {
+    const hd = e.c.head_dim;
+    const qn = lay.wq_a.n;
+    const qw = e.heads() * hd;
+    const sp = ch.sp orelse return error.NotAnSpChunk;
+    const o = sp.owners();
+    const ps = ovl.ownFirst(o, sp.g) orelse return error.NotAnSpChunk;
+    const emulate = e.attn.?.emulate;
+    for (0..4) |g| if (emulate or g == sp.g) try frontRows(e, ch, lay, .{ .r0 = o.r0(g), .rows = o.rows(g) });
+    const side: ?*ovl.Side = if (emulate or e.attn.?.no_gather) null else e.side;
+    if (!emulate and !e.attn.?.no_gather) {
+        if (side) |sd| {
+            try sd.fork(e.s);
+            try gatherOwn(e, sp, ch.qr, qn * 2, sd.stream);
+            try gatherOwn(e, sp, ch.y, hd * 2, sd.stream);
+            try sd.end(.xag);
+        } else {
+            try gatherOwn(e, sp, ch.qr, qn * 2, e.s);
+            try gatherOwn(e, sp, ch.y, hd * 2, e.s);
+            try pm(e, .comm);
+        }
+    }
+    try mmRows(e, ch, ps[0].rows, lay.wq_b, ch.qr + ps[0].r0 * qn * 2, qn, ch.q + ps[0].r0 * qw * 2, .bf16, qw);
+    try pm(e, .dense);
+    if (side) |sd| {
+        try sd.join(e.s, .xag);
+        try pm(e, .comm);
+    }
+    for ([_]ovl.Range{ ps[1], ps[2] }) |r| if (r.rows != 0) try mmRows(e, ch, r.rows, lay.wq_b, ch.qr + r.r0 * qn * 2, qn, ch.q + r.r0 * qw * 2, .bf16, qw);
     try pm(e, .dense);
 }
 
@@ -1118,7 +1201,7 @@ fn attnFront(e: *const Engine, ch: *Chunk, lay: weights.Layer, r: ovl.Range) !vo
 /// _compress's new latents (ratio 1: RMSNorm of the bf16 projection; ratio 2: of the pairs' softmax-weighted kv), its
 /// positional store's last RAW rows, then the index keys (RMSNorm of idx_wk's projection, RoPE) and the RoPE'd latents
 /// into the caches as FP4 (fp4_store).
-fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize) !void {
+pub fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize) !void {
     const lay = e.w.layers[li];
     const c = e.c;
     const n = ch.n;
@@ -1196,6 +1279,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         return;
     }
     if (n_comp_end > ch.max_comp) return error.ChunkTooLong;
+    if (isplitOn(e, ch, li)) return indexerSplit(e, ch, cs, sh, li, wqb, src, rope);
     try mm(e, ch, wqb, ch.qr, lay.wq_a.n, ch.iq, .bf16, ih * id);
     try pm(e, .dense);
     try tri_norm.ropeHeads(e.t, ch.iq, rope.cos, rope.sin, ch.pos, c.rope_dim, false, n, ih, id);
@@ -1226,6 +1310,123 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     }
     sh.kk = kk_pass.?;
     try pm(e, .attn);
+}
+
+/// TF_DS_PROMPT_ATTN=isplit on layer li (an indexer layer): every chunk of the pass selects keyed with k = index_topk
+/// (the int64 keys and their top-k, never the fp32 scores' pool), so each row's selection is its own launches' alone.
+pub fn isplitOn(e: *const Engine, ch: *const Chunk, li: usize) bool {
+    if (!attnLevers(e, ch, li).isplit) return false;
+    const c = e.c;
+    const ratio: usize = e.w.layers[li].ratio;
+    if (ratio == 0 or li == c.candidate_source or c.candidate_source < li) return false;
+    const sub = if (ch.sub_rows != 0) ch.sub_rows else ch.n;
+    var s0: usize = 0;
+    while (s0 < ch.n) : (s0 += sub) {
+        const sn = @min(sub, ch.n - s0);
+        const nce = if (ch.sub_rows != 0) (ch.start + s0 + sn) / ratio else (ch.start + ch.n) / ratio;
+        if (@min(c.index_topk, nce) != c.index_topk or c.index_topk & (c.index_topk - 1) != 0) return false;
+    }
+    return true;
+}
+
+/// TF_DS_PROMPT_ATTN=isplit: the indexer of this node's own rows (indexer's launches on those rows: idx_wq_b, RoPE,
+/// fp4_qd, and each row block's scores and selection for the block's rows here), the head weights on every row as
+/// today (cuBLAS by 2,048-row chunk), then the selection of every owner's rows gathered in place. With emulate (the
+/// benchmark), every owner's rows one after another, no gather.
+fn indexerSplit(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, wqb: weights.Linear, src: usize, rope: Rope) !void {
+    const lay = e.w.layers[li];
+    const c = e.c;
+    const n = ch.n;
+    const ih = c.index_heads;
+    const id = c.index_head_dim;
+    const qn = lay.wq_a.n;
+    const sp = ch.sp orelse return error.NotAnSpChunk;
+    const o = sp.owners();
+    const emulate = e.attn.?.emulate;
+    for (0..4) |g| {
+        if (!emulate and g != sp.g) continue;
+        const r0 = o.r0(g);
+        const rows = o.rows(g);
+        try mmRows(e, ch, rows, wqb, ch.qr + r0 * qn * 2, qn, ch.iq + r0 * ih * id * 2, .bf16, ih * id);
+        try pm(e, .dense);
+        try tri_norm.ropeHeads(e.t, ch.iq + r0 * ih * id * 2, rope.cos, rope.sin, ch.pos + r0 * 8, c.rope_dim, false, rows, ih, id);
+        try tri_attn.fp4QdP2(e.t, ch.iq + r0 * ih * id * 2, ch.iq4 + r0 * ih * id * 2, rows * ih * id);
+        try pm(e, .attn);
+    }
+    try e.ops.toF32(e.s, ch.x, ch.xf, n * c.hidden);
+    try xwTRows(e, ch, ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih);
+    try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
+    try pm(e, .dense);
+    const sub = if (ch.sub_rows != 0) ch.sub_rows else n;
+    const ratio: usize = lay.ratio;
+    for (0..4) |g| {
+        if (!emulate and g != sp.g) continue;
+        var s0: usize = 0;
+        while (s0 < n) : (s0 += sub) {
+            const sn = @min(sub, n - s0);
+            const nce = if (ch.sub_rows != 0) (ch.start + s0 + sn) / ratio else (ch.start + n) / ratio;
+            try selectRowsPart(e, ch, cs, src, s0, sn, nce, o.r0(g), o.r0(g) + o.rows(g));
+        }
+    }
+    sh.kk = c.index_topk;
+    try pm(e, .attn);
+    if (!emulate and !e.attn.?.no_gather) {
+        try gatherOwn(e, sp, ch.cidx, c.index_topk * 8, e.s);
+        try pm(e, .comm);
+    }
+}
+
+/// selectRows' keyed selection (isplitOn) of the rows [lo, hi) of the chunk among its rows [s0, s0 + n): each row
+/// block of today's (the same rb, n_comp_end, kernels) cut to those rows. A block of decode_rows rows or fewer
+/// (_index_score, its VIS where today's is) runs whole when any of its rows is here (the others' rows get the same
+/// bytes their owner computes); a larger block's rows here take _index_score_rows over them alone (one row a program),
+/// a lone row with the row after it (no rows == 1 specialization; that row's keys are not read), then the top-k of
+/// the rows here.
+fn selectRowsPart(e: *const Engine, ch: *Chunk, cs: *const Caches, src: usize, s0: usize, n: usize, n_comp_end: usize, lo: usize, hi: usize) !void {
+    const c = e.c;
+    const ih = c.index_heads;
+    const id = c.index_head_dim;
+    const kk = c.index_topk;
+    const rb = rowBlock(n, n_comp_end);
+    if (rb * n_comp_end > key_elems) return error.ChunkTooLong;
+    const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
+    const torch_topk: tri_index.TopK = .{ .top = ch.ktop, .ctx = @ptrCast(@constCast(e)), .run = torchTopk };
+    if (tri_index.prunes(n_comp_end, kk) and (rb > pruned_rows or ch.pbufs.cand == 0)) return error.ChunkTooLong;
+    var r0: usize = 0;
+    while (r0 < n) : (r0 += rb) {
+        const m = @min(n, r0 + rb) - r0;
+        const b0 = s0 + r0;
+        const a = @max(b0, lo);
+        const z = @min(b0 + m, hi);
+        if (a >= z) continue;
+        const row = if (m <= tri.decode_rows) b0 else a;
+        const sel = if (m <= tri.decode_rows) m else z - a;
+        const q = ch.iq4 + row * ih * id * 2;
+        const wb = ch.iw + row * ih * 2;
+        const vr = ch.vis + row * 8;
+        const out = ch.cidx + row * kk * 8;
+        if (m <= tri.decode_rows) {
+            try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.keys, null, true, ch.tmax, false, m, ih, id);
+        } else {
+            if (row + @max(sel, 2) > ch.cap) return error.ChunkTooLong;
+            try tri_index.indexScoreRows(e.t, q, k, wb, vr, n_comp_end, ch.keys, true, ch.tmax, @max(sel, 2), ih, id);
+        }
+        try selectKeyed(e, ch, n_comp_end, kk, vr, out, torch_topk, sel);
+    }
+}
+
+/// A keyed row block's top-k (topk_select_pruned of the block's keys and tile maxima, as written by the scores): with
+/// TF_DS_PROMPT_ATTN=tsel one launch a row (attn.tsel) wherever topk_select would not take its fused launch; the same
+/// selection (attn_prompt.cu).
+fn selectKeyed(e: *const Engine, ch: *const Chunk, n: usize, kk: usize, vis: u64, out: u64, torch_topk: tri_index.TopK, rows: usize) !void {
+    if (e.attn) |st| if (st.lv.tsel and kk == attn.tsel_k) {
+        const pr = tri_index.prunes(n, kk);
+        if (pr or !tri_index.fusedSelect(n, kk, n, rows)) {
+            const nt = (n + tri_index.tile - 1) / tri_index.tile;
+            return attn.tsel(st.k.?, e.s, ch.keys, n, n, if (pr) ch.tmax else null, nt, vis, out, rows);
+        }
+    };
+    return tri_index.topkSelectPruned(e.t, ch.keys, n, ch.tmax, kk, vis, out, ch.pbufs, torch_topk, rows, n);
 }
 
 /// The indexer's selection for the chunk's rows [s0, s0 + n) scoring n_comp_end keys (the whole chunk: s0 0, n its rows):
@@ -1264,7 +1465,7 @@ fn selectRows(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: 
         const out = ch.cidx + row * kk * 8;
         if (keyed) {
             try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.keys, null, true, ch.tmax, false, m, ih, id);
-            try tri_index.topkSelectPruned(e.t, ch.keys, n_comp_end, ch.tmax, kk, vr, out, ch.pbufs, torch_topk, m, n_comp_end);
+            try selectKeyed(e, ch, n_comp_end, kk, vr, out, torch_topk, m);
         } else {
             try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.score, null, false, null, false, m, ih, id);
             const mrows = ch.pool + row * ch.pool_ms;

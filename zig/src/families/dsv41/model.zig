@@ -31,6 +31,7 @@ const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
 const pprof_mod = @import("pprof.zig");
 const ovl = @import("ovl.zig");
+const attn = @import("attn.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -90,6 +91,12 @@ pub fn promptA2a() !bool {
 pub fn promptOvl() !ovl.Levers {
     const v = std.c.getenv("TF_DS_PROMPT_OVL") orelse return .{};
     return ovl.parse(std.mem.span(v));
+}
+
+/// TF_DS_PROMPT_ATTN (four-node split, with SP rows; attn.zig): front, isplit, all. Unset / "" / "off": as served.
+pub fn promptAttn() !attn.Levers {
+    const v = std.c.getenv("TF_DS_PROMPT_ATTN") orelse return .{};
+    return attn.parse(std.mem.span(v));
 }
 
 /// TF_DS_PROMPT_OVERLAP=1 (four-node split, with TF_DS_PROMPT_CHUNK=4096): an encoder-only pass's two chunks run one
@@ -262,6 +269,8 @@ pub const Model = struct {
     pprof: ?*pprof_mod.Prof = null, // TF_DS_PROMPT_PROF=1: the prompt chunks' GPU time by phase
     rdma_rings: ?ring2d.Rings = null,
     ovl_side: ?ovl.Side = null, // TF_DS_PROMPT_OVL: the comm stream, its events and the launch order (promptOvl)
+    attn_st: attn.State = .{}, // TF_DS_PROMPT_ATTN: its levers (promptAttn; the engine points here when any is on)
+    attn_k: ?attn.Kernels = null, // its tsel kernel (attn_prompt.cu)
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
@@ -318,6 +327,8 @@ pub const Model = struct {
         m.sp_mode = spMode();
         m.pprof = null;
         m.ovl_side = null;
+        m.attn_st = .{};
+        m.attn_k = null;
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
@@ -339,6 +350,9 @@ pub const Model = struct {
             if (sp.pair == null) return error.OvlNeedsTheFourNodeSplit;
             if (promptOverlap()) return error.OvlWithOverlap;
         }
+        const attn_lv = try promptAttn(); // (likewise)
+        if (attn_lv.sp() and sp.pair == null) return error.AttnNeedsTheFourNodeSplit;
+        if (attn_lv.any() and promptOverlap()) return error.AttnWithOverlap;
         m.w = try weights.load(gpa, d, .{ .cache = .{ .file = m.cache_file, .index = &m.ix, .io = io } }, c.*, sp, o.drafts);
         errdefer m.w.deinit();
         if (o.drafts and m.w.dspark == null) return error.NoDrafter;
@@ -445,6 +459,17 @@ pub const Model = struct {
         }
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
         m.eng.round_rows = o.round_rows;
+        if (attn_lv.any()) {
+            m.attn_st = .{ .lv = attn_lv };
+            if (attn_lv.tsel) {
+                if (!cuda.kernels.available) return error.NoKernelImages;
+                m.attn_k = try attn.Kernels.load(d, cuda.kernels.dsv41_attn);
+                m.attn_st.k = &m.attn_k.?;
+            }
+            m.eng.attn = &m.attn_st;
+            var nb: [64]u8 = undefined;
+            std.log.info("TF_DS_PROMPT_ATTN={s}: the attention's replicated work on owned rows ({s})", .{ attn_lv.names(&nb), if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset" });
+        }
         if (m.par) |*x| m.eng.par = x;
         if (m.x2) |*x| {
             m.eng.x2 = x;
@@ -600,6 +625,7 @@ pub const Model = struct {
         m.rope_buf.free();
         if (m.par) |*x| x.unload();
         if (m.x2) |*x| x.unload();
+        if (m.attn_k) |*x| x.unload();
         m.ex.unload();
         m.ops.unload();
         m.exk.unload();

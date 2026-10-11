@@ -41,6 +41,9 @@
 //!   TF_DS_PROMPT_OVL=engram,xag,wob[,prio]|all  with SP rows: an SP chunk's exchanges on a comm stream under compute
 //!                                               that does not read them yet, one NCCL communicator in one launch
 //!                                               order (ovl.zig; engram needs TF_DS_PROMPT_ENGRAM=sp)
+//!   TF_DS_PROMPT_ATTN=front,isplit|all          with SP rows: an SP chunk's attention without the work every node
+//!                                               repeated: the front (wq_a, wkv, q_norm) and the indexer (queries,
+//!                                               scores, top-k) on the owned rows, their outputs gathered (attn.zig)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the

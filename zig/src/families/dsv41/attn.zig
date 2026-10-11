@@ -126,6 +126,8 @@ pub const tsel_k = 512;
 pub fn tsel(k: *const Kernels, s: cuda.Stream, keys: u64, ks: usize, n: usize, tmax: ?u64, nt: usize, vis: u64, out: u64, rows: usize) !void {
     if (rows == 0) return;
     if (n < tsel_k or n > std.math.maxInt(c_int) or nt > std.math.maxInt(c_int)) return error.BadTopK;
+    // the pruned mode selects k of the tile maxima first: it needs more than k tiles (tri_index.prunes)
+    if (tmax != null and nt <= tsel_k) return error.BadTopK;
     var a: cuda.Args = .{};
     a.add(keys);
     a.add(@as(c_longlong, @intCast(ks)));

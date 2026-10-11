@@ -350,34 +350,10 @@ pub const Model = struct {
         if (m.round_ms.len == 0) return error.BadRoundMs;
         m.pool_cap = o.pool;
         m.ctx_cap = if (o.context != 0) @min(o.context, o.pool) else o.pool;
-        m.fill_slot = 0;
-        m.prof = false;
-        m.timer = null;
-        m.ptimer = null;
-        m.t_enqueue = 0;
-        m.t_forward = 0;
-        m.t_absorb = 0;
-        m.dpool = null;
-        m.dr = null;
-        m.tables = null;
-        m.epool = null;
-        m.aio = null;
-        m.paio = null;
-        m.eh = null;
-        m.rdma_mod = null;
-        m.ring = null;
-        m.graphs = null;
-        m.pgraphs = null;
-        m.two = null;
-        m.rdma_rings = null;
+        m.clearState();
         m.pass_rows = try promptChunk();
-        m.ov = null;
         m.sp_rows = spRows();
         m.sp_mode = spMode();
-        m.pprof = null;
-        m.ovl_side = null;
-        m.attn_st = .{};
-        m.attn_k = null;
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
@@ -653,6 +629,49 @@ pub const Model = struct {
             m.pprof = p;
         }
         return m;
+    }
+
+    /// The fields with a meaning before anything is set up (null, zero, empty): open builds the Model field by field
+    /// on `undefined` memory, so a field's default never applies there and every one of these is set here. A field
+    /// added with a default (an optional, a counter) belongs in this list, else it is garbage (0xaa.. in a safe build)
+    /// when its switch is off: stage ZE2's `epf` was, and its first prompt's fill jumped through it.
+    fn clearState(m: *Model) void {
+        m.fill_slot = 0;
+        m.fill_seq = &.{};
+        m.ahead = null;
+        m.prof = false;
+        m.timer = null;
+        m.ptimer = null;
+        m.t_enqueue = 0;
+        m.t_forward = 0;
+        m.t_absorb = 0;
+        m.clk_ph = @splat(0);
+        m.clk_cnt = @splat(0);
+        m.clk_rounds = 0;
+        m.dpool = null;
+        m.dr = null;
+        m.tables = null;
+        m.epool = null;
+        m.aio = null;
+        m.paio = null;
+        m.eh = null;
+        m.epf = null;
+        m.rdma_mod = null;
+        m.ring = null;
+        m.graphs = null;
+        m.pgraphs = null;
+        m.two = null;
+        m.rdma_rings = null;
+        m.pass_rows = chunk_rows;
+        m.ov = null;
+        m.sp_rows = false;
+        m.sp_mode = .off;
+        m.pprof = null;
+        m.ovl_side = null;
+        m.attn_st = .{};
+        m.attn_k = null;
+        m.x2 = null;
+        m.img_buf = null;
     }
 
     pub fn close(m: *Model) void {
@@ -1289,5 +1308,32 @@ test "prompt passes: two chunks where both end by the replay, else one chunk; 2,
             start += n;
         }
         try std.testing.expectEqual(len, start);
+    }
+}
+
+test "open's state on undefined memory: every optional null with the switches off (TF_DS_ENGRAM_PREFETCH unset)" {
+    // as open builds it: the Model on fresh memory, `undefined` (0xaa..), then clearState
+    const a = std.testing.allocator;
+    const m = try a.create(Model);
+    defer a.destroy(m);
+    @memset(std.mem.asBytes(m), 0xaa);
+    m.clearState();
+    try std.testing.expect(m.epf == null);
+    try std.testing.expect(m.eh == null);
+    try std.testing.expect(m.aio == null);
+    try std.testing.expect(m.paio == null);
+    try std.testing.expect(m.ahead == null);
+    try std.testing.expect(m.ov == null);
+    try std.testing.expectEqual(@as(usize, 0), m.fill_seq.len);
+    try std.testing.expectEqual(@as(u64, 0), m.clk_rounds);
+    // every optional field with a null default is null after clearState (a new one left out of it fails here)
+    const info = @typeInfo(Model).@"struct";
+    inline for (info.field_names, info.field_types, info.field_attrs) |name, T, at| {
+        if (@typeInfo(T) == .optional and at.default_value_ptr != null) {
+            if (@field(m, name) != null) {
+                std.debug.print("Model.{s} is not set by clearState\n", .{name});
+                return error.TestUnexpectedResult;
+            }
+        }
     }
 }

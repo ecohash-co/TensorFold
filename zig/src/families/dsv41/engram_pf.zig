@@ -557,6 +557,16 @@ test "prefetched rows equal the rows engramApply reads itself, at every depth, w
     const h = engram.Hasher.init(c, &map, .{ .{ 3, 5, 7, 9 }, .{ 11, 13, 15, 17 } });
     const pool = try engram_io.Pool.init(a, io, 2);
     defer pool.deinit(a);
+    // the Engram host as model.open builds it with TF_DS_ENGRAM_PREFETCH unset: no reader (its rows read as served)
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const eh = try @import("prompt.zig").EngramHost.init(arena.allocator(), &c, h, &tables, pool, 0, 2, 32);
+        try std.testing.expect(eh.pf == null);
+        try std.testing.expect(eh.paio == null);
+        try std.testing.expect(eh.aio == null);
+        try std.testing.expect(!eh.ahead_ready[0] and !eh.ahead_ready[1]);
+    }
     var prng = std.Random.DefaultPrng.init(11);
     var seq: [200]i32 = undefined;
     for (&seq) |*x| x.* = prng.random().intRangeLessThan(i32, 0, 6);

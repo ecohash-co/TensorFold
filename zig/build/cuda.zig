@@ -33,6 +33,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_experts_par", .src = "dsv41/experts_par", .flags = &.{ "-O3", "-lineinfo" } }, // ours: the exl3 extension's gate / up with the parity split's rest in its grid (tensorfold_exl3_experts_v19's flags)
     .{ .name = "dsv41_exl3_prompt", .src = "dsv41/exl3_prompt", .flags = &.{ "-O3", "-lineinfo" } }, // ours: TF_DS_EXL3_PROMPT=v2's gate / up (input rotation in the program) and down prompt GEMMs, the served arithmetic (tensorfold_exl3_experts_v19's flags)
     .{ .name = "dsv41_attn", .src = "dsv41/attn_prompt", .flags = &.{ "-O3", "-lineinfo" } }, // ours: TF_DS_PROMPT_ATTN=tsel's one-launch top-k of the prompt indexer (attn.zig)
+    .{ .name = "dsv41_router", .src = "dsv41/router_own", .flags = &.{ "-O3", "--fmad=false", "-lineinfo" } }, // ours: TF_DS_PROMPT_ROUTER=own's gate logits of the own rows with today's cuBLAS run's split-K arithmetic (router.zig)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -147,6 +148,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_attn.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_attn.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-attn-bench", .root_module = ds_attn }));
+    // TF_DS_PROMPT_ROUTER (stage ZR1): the own-row router against today's cuBLAS runs on one GPU with each layer's real
+    // gate, every byte of the logits, picks and weights compared, and its cost
+    const ds_router = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/router_bench_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_router.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    ds_router.addImport("cuda", cuda);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-router-bench", .root_module = ds_router }));
     // the Engram reader's buffered, O_DIRECT and AIO paths on the real tables, every byte compared
     const ds_engram = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/engram_check_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_engram.addImport("dsv41", ds_check.import_table.get("dsv41").?);

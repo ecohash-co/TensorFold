@@ -32,6 +32,7 @@ const rdma = @import("rdma.zig");
 const pprof_mod = @import("pprof.zig");
 const ovl = @import("ovl.zig");
 const attn = @import("attn.zig");
+const router = @import("router.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -98,6 +99,12 @@ pub fn promptOvl() !ovl.Levers {
 pub fn promptAttn() !attn.Levers {
     const v = std.c.getenv("TF_DS_PROMPT_ATTN") orelse return .{};
     return attn.parse(std.mem.span(v));
+}
+
+/// TF_DS_PROMPT_ROUTER (four-node split, with SP rows; router.zig): own, own,hide, all. Unset / "" / "off": as served.
+pub fn promptRouter() !router.Levers {
+    const v = std.c.getenv("TF_DS_PROMPT_ROUTER") orelse return .{};
+    return router.parse(std.mem.span(v));
 }
 
 /// TF_DS_PROMPT_OVL=pack3: each encoder layer's gate / up epilogue tables (svh_g, svh_u, suh_d [E, width], read at
@@ -318,6 +325,8 @@ pub const Model = struct {
     ovl_side: ?ovl.Side = null, // TF_DS_PROMPT_OVL: the comm stream, its events and the launch order (promptOvl)
     attn_st: attn.State = .{}, // TF_DS_PROMPT_ATTN: its levers (promptAttn; the engine points here when any is on)
     attn_k: ?attn.Kernels = null, // its tsel kernel (attn_prompt.cu)
+    router_st: router.State = .{}, // TF_DS_PROMPT_ROUTER: its levers, kernels and calibrated split-K (promptRouter)
+    router_k: ?router.Kernels = null, // router_own.cu
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
@@ -376,6 +385,8 @@ pub const Model = struct {
         m.ovl_side = null;
         m.attn_st = .{};
         m.attn_k = null;
+        m.router_st = .{};
+        m.router_k = null;
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
@@ -400,6 +411,12 @@ pub const Model = struct {
         const attn_lv = try promptAttn(); // (likewise)
         if (attn_lv.sp() and sp.pair == null) return error.AttnNeedsTheFourNodeSplit;
         if (attn_lv.any() and promptOverlap()) return error.AttnWithOverlap;
+        const router_lv = try promptRouter(); // (likewise)
+        if (router_lv.any()) {
+            if (sp.pair == null) return error.RouterNeedsTheFourNodeSplit;
+            if (promptOverlap()) return error.RouterWithOverlap;
+            if (router_lv.hide and !ovl_lv.any()) return error.RouterHideNeedsOvl;
+        }
         m.w = try weights.load(gpa, d, .{ .cache = .{ .file = m.cache_file, .index = &m.ix, .io = io } }, c.*, sp, o.drafts);
         errdefer m.w.deinit();
         if (o.drafts and m.w.dspark == null) return error.NoDrafter;
@@ -530,6 +547,11 @@ pub const Model = struct {
             var nb: [64]u8 = undefined;
             std.log.info("TF_DS_PROMPT_ATTN={s}: the attention's replicated work on owned rows ({s})", .{ attn_lv.names(&nb), if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset" });
         }
+        if (router_lv.any()) {
+            // (Chunk.init sizes the picks' gather staging from it; the kernels and the split-K come after cuBLAS opens)
+            m.router_st = .{ .lv = router_lv };
+            m.eng.router = &m.router_st;
+        }
         if (m.par) |*x| m.eng.par = x;
         if (m.x2) |*x| {
             m.eng.x2 = x;
@@ -543,6 +565,23 @@ pub const Model = struct {
         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
         errdefer m.blas.close();
         m.eng.blas = &m.blas;
+        errdefer if (m.router_k) |*x| x.unload();
+        if (router_lv.any()) {
+            // TF_DS_PROMPT_ROUTER: router_own.cu, and today's 2,048-row cuBLAS run's split-K found on this GPU and
+            // library against the library's own call (layer 0's gate; every own-row variant checked; no match: no start)
+            if (!cuda.kernels.available) return error.NoKernelImages;
+            m.router_k = try router.Kernels.load(d, cuda.kernels.dsv41_router);
+            try m.ops.f16ToF32(m.stream, m.w.layers[0].gate_w, m.ch.gate_f, c.experts * c.hidden);
+            const cal = try router.calibrate(gpa, d, &m.router_k.?, &m.blas, m.stream, m.w.layers[0].gate_w, m.ch.gate_f, c.hidden, c.experts);
+            m.router_st.k = &m.router_k.?;
+            m.router_st.parts = cal.parts;
+            var nb: [32]u8 = undefined;
+            var pb: [96]u8 = undefined;
+            var pn: usize = 0;
+            const np: usize = @intCast(cal.parts.n);
+            for (cal.parts.b[1 .. np + 1], 0..) |b, i| pn += (std.fmt.bufPrint(pb[pn..], "{s}{d}", .{ if (i == 0) "" else ",", b }) catch break).len;
+            std.log.info("TF_DS_PROMPT_ROUTER={s}: the MoE router on owned rows, picks gathered; today's 2,048-row cuBLAS run is split-K {d} at k {s} (candidate {d}, checked) ({s})", .{ router_lv.names(&nb), cal.parts.n, pb[0..pn], cal.tried, if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset" });
+        }
         m.rings = try a.alloc(u64, c.layers);
         m.ring_view = try a.alloc(u64, c.layers);
         for (m.rings) |*r| {
@@ -686,6 +725,7 @@ pub const Model = struct {
         if (m.par) |*x| x.unload();
         if (m.x2) |*x| x.unload();
         if (m.attn_k) |*x| x.unload();
+        if (m.router_k) |*x| x.unload();
         m.ex.unload();
         m.ops.unload();
         m.exk.unload();

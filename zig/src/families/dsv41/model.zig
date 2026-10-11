@@ -95,7 +95,7 @@ pub fn promptOvl() !ovl.Levers {
     return ovl.parse(std.mem.span(v));
 }
 
-/// TF_DS_PROMPT_ATTN (four-node split, with SP rows; attn.zig): front, isplit, all. Unset / "" / "off": as served.
+/// TF_DS_PROMPT_ATTN (four-node split, with SP rows; attn.zig): front, isplit, tsel, all. Unset / "" / "off": as served.
 pub fn promptAttn() !attn.Levers {
     const v = std.c.getenv("TF_DS_PROMPT_ATTN") orelse return .{};
     return attn.parse(std.mem.span(v));

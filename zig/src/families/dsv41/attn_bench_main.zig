@@ -12,12 +12,21 @@
 //! line a run. --levers: a comma list of TF_DS_PROMPT_ATTN levers (attn.zig) for the runs after the first; --cmp 1:
 //! the first run with no lever, then every layer's outputs of each later run compared byte for byte with it (q, the
 //! window keys, o, u, pa, the selection and the caches the layer writes, the ring).
+//!
+//! --tsel-sweep 1 (stage ZT2; no weights loaded, MODEL_DIR / CACHE_DIR / RANK / WORLD unused): TF_DS_PROMPT_ATTN=tsel's
+//! kernel against today's chain (tri_index.topkSelectPruned: _topk_sel, or torch's top-k + _topk_finish, or the pruned
+//! chain with _gather_tiles) on host-made indexer keys (kernels.py's key: the score's ordered bits above, 0xFFFFFFFF - t
+//! below; -inf past each row's vis) and their tile maxima, over key counts n (512 .. 524,288: unpruned, the first
+//! pruned n, 1M-context sizes), rows (1, 2, 3, 17 and the engine's row blocks), vis patterns (all, a causal ramp, 1, 37,
+//! half) and score patterns (Gaussian, four distinct values, all zero); each output row byte-compared with the chain
+//! and with a host reference (the 512 largest keys' positions sorted, -1 at or past vis). One JSON line a case, then
+//! a summary line; a few cases also time both (events, 5 iterations).
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const prompt = dsv41.prompt;
 
-const usage = "usage: tf-dsv41-attn-bench MODEL_DIR CACHE_DIR RANK WORLD KIT_DIR [--start S] [--rows N] [--iters K] [--seed X] [--sub 2048|0] [--levers LIST] [--cmp 0|1] [--layers N]\n";
+const usage = "usage: tf-dsv41-attn-bench MODEL_DIR CACHE_DIR RANK WORLD KIT_DIR [--start S] [--rows N] [--iters K] [--seed X] [--sub 2048|0] [--levers LIST] [--cmp 0|1] [--layers N] [--tsel-sweep 1]\n";
 
 fn readFile(a: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![]const u8 {
     const path = try std.fs.path.join(a, &.{ dir, name });
@@ -77,16 +86,18 @@ pub fn main(init: std.process.Init) !u8 {
     var levers_text: []const u8 = "";
     var cmp = false;
     var n_layers: usize = 20;
+    var tsel_sweep = false;
     var i: usize = 6;
     while (i + 1 < args.len) : (i += 2) {
         const k = args[i];
         const v = args[i + 1];
-        if (std.mem.eql(u8, k, "--start")) start = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--rows")) rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--iters")) iters = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--seed")) seed = try std.fmt.parseInt(u64, v, 10) else if (std.mem.eql(u8, k, "--sub")) sub = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--levers")) levers_text = v else if (std.mem.eql(u8, k, "--cmp")) cmp = !std.mem.eql(u8, v, "0") else if (std.mem.eql(u8, k, "--layers")) n_layers = try std.fmt.parseInt(usize, v, 10) else {
+        if (std.mem.eql(u8, k, "--tsel-sweep")) tsel_sweep = !std.mem.eql(u8, v, "0") else if (std.mem.eql(u8, k, "--start")) start = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--rows")) rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--iters")) iters = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--seed")) seed = try std.fmt.parseInt(u64, v, 10) else if (std.mem.eql(u8, k, "--sub")) sub = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--levers")) levers_text = v else if (std.mem.eql(u8, k, "--cmp")) cmp = !std.mem.eql(u8, v, "0") else if (std.mem.eql(u8, k, "--layers")) n_layers = try std.fmt.parseInt(usize, v, 10) else {
             std.debug.print("{s}", .{usage});
             return 2;
         }
     }
     const lv = try dsv41.attn.parse(if (levers_text.len == 0) null else levers_text);
+    if (tsel_sweep) return tselSweep(init, a, io, kit, seed);
     const cap: usize = 4096;
     if (rows > cap or rows < 256 or start % cap != 0) return error.BadShape;
     const ctx_cap = start + cap;
@@ -321,4 +332,220 @@ fn layerDigests(e: *const prompt.Engine, ch: *const prompt.Chunk, cs: *const pro
     }
     g.v[8] = try digest(d, a, ring, e.ringBytes());
     return g;
+}
+
+// -- --tsel-sweep (stage ZT2) ------------------------------------------------------------------------------------
+
+/// kernels.py's int64 key of a score at position t: ordered score bits above (-0 as +0), 0xFFFFFFFF - t below.
+fn keyOf(sc: f32, t: usize) i64 {
+    const bits: i32 = if (sc == 0.0) 0 else @bitCast(sc);
+    const ordered: i32 = if (bits < 0) bits ^ 0x7FFFFFFF else bits;
+    const hi: u64 = @as(u64, @bitCast(@as(i64, ordered))) << 32;
+    return @bitCast(hi | (0xFFFFFFFF - @as(u64, @intCast(t))));
+}
+
+const TopkCtx = struct { ops: *const dsv41.ops.Ops, s: cuda.Stream };
+
+fn sweepTopk(ctx: ?*anyopaque, _: dsv41.tri.Tri, keys: u64, ks: usize, rows: usize, n: usize, k: usize, top: u64) anyerror!void {
+    const c: *const TopkCtx = @ptrCast(@alignCast(ctx.?));
+    try c.ops.topkI64(c.s, keys, ks, rows, n, k, top);
+}
+
+const VisMode = enum { all, ramp, one, small, half };
+const ScoreMode = enum { gauss, ties, zero };
+
+fn visOf(m: VisMode, n: usize, rows: usize, r: usize) usize {
+    return switch (m) {
+        .all => n,
+        .ramp => n - (rows - 1 - r) * @min(n / (rows + 1), 64), // a causal chunk: later rows see more
+        .one => 1,
+        .small => 37,
+        .half => n / 2 + r,
+    };
+}
+
+fn tselSweep(init: std.process.Init, a: std.mem.Allocator, io: std.Io, kit: []const u8, seed: u64) !u8 {
+    const tri_index = dsv41.tri_index;
+    const attn = dsv41.attn;
+    const kk = attn.tsel_k;
+    var driver = try cuda.Driver.open();
+    defer driver.close();
+    var ctx = try cuda.Context.init(&driver, 0);
+    defer ctx.deinit();
+    const d = &driver;
+    var s = try cuda.Stream.init(d, true);
+    defer s.deinit();
+    var set = try cuda.aot.Set.load(init.gpa, io, d, ctx.device, try std.fs.path.join(a, &.{ kit, "aot" }));
+    defer set.deinit();
+    var ops = try dsv41.ops.Ops.load(d, cuda.kernels.torch_pointwise, cuda.kernels.torch_movement, cuda.kernels.dsv41_ops);
+    defer ops.unload();
+    var ak = try attn.Kernels.load(d, cuda.kernels.dsv41_attn);
+    defer ak.unload();
+    const t: dsv41.tri.Tri = .{ .set = &set, .stream = s };
+    var tctx: TopkCtx = .{ .ops = &ops, .s = s };
+    const topk: tri_index.TopK = .{ .top = 0, .ctx = @ptrCast(&tctx), .run = sweepTopk };
+
+    var out_buf: [1 << 14]u8 = undefined;
+    var out = std.Io.File.stdout().writer(io, &out_buf);
+    try out.interface.print("{{\"tsel_sweep\": true, \"smem\": {d}, \"seed\": {d}}}\n", .{ ak.smem, seed });
+    try out.interface.flush();
+
+    // the largest case's buffers, carved per case
+    const max_keys: usize = 4 << 20; // rows * n
+    const max_rows: usize = 256;
+    var b_keys = try cuda.DeviceBuffer.alloc(d, max_keys * 8);
+    defer b_keys.free();
+    var b_tmax = try cuda.DeviceBuffer.alloc(d, (max_keys / tri_index.tile + max_rows) * 8);
+    defer b_tmax.free();
+    var b_vis = try cuda.DeviceBuffer.alloc(d, max_rows * 8);
+    defer b_vis.free();
+    var b_every = try cuda.DeviceBuffer.alloc(d, max_rows * 8);
+    defer b_every.free();
+    var b_oa = try cuda.DeviceBuffer.alloc(d, max_rows * kk * 8);
+    defer b_oa.free();
+    var b_ob = try cuda.DeviceBuffer.alloc(d, max_rows * kk * 8);
+    defer b_ob.free();
+    var b_top = try cuda.DeviceBuffer.alloc(d, max_rows * kk * 8);
+    defer b_top.free();
+    var b_tpos = try cuda.DeviceBuffer.alloc(d, max_rows * kk * 8);
+    defer b_tpos.free();
+    var b_cand = try cuda.DeviceBuffer.alloc(d, max_rows * kk * tri_index.tile * 8);
+    defer b_cand.free();
+    {
+        const ev = try a.alloc(i64, max_rows);
+        @memset(ev, tri_index.every_vis);
+        try b_every.upload(0, std.mem.sliceAsBytes(ev));
+    }
+    var e0 = try cuda.Event.init(d, true);
+    defer e0.deinit();
+    var e1 = try cuda.Event.init(d, true);
+    defer e1.deinit();
+    var e2 = try cuda.Event.init(d, true);
+    defer e2.deinit();
+
+    const ns = [_]usize{ 512, 513, 1000, 1056, 2048, 2100, 4095, 4096, 4097, 6000, 6145, 8250, 16500, 32768, 32769, 32832, 40000, 63488, 65536, 78470, 131072, 524288 };
+    const rows_set = [_]usize{ 1, 2, 3, 17 };
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    var cases: usize = 0;
+    var eq_chain: usize = 0;
+    var eq_ref: usize = 0;
+    var no_chain: usize = 0;
+    var used: usize = 0; // cases the engine sends to tsel (pruned, or not the fused selection)
+
+    // the engine's row blocks at a few n (prompt.rowBlock with the 4,096-row chunk), timed
+    const Case = struct { n: usize, rows: usize, vm: VisMode, sm: ScoreMode, time: bool };
+    var list: std.ArrayList(Case) = .empty;
+    for (ns) |n| for (rows_set) |rows| {
+        if (n >= 524288 and rows > 3) continue;
+        for (std.enums.values(VisMode)) |vm| for (std.enums.values(ScoreMode)) |sm| {
+            try list.append(a, .{ .n = n, .rows = rows, .vm = vm, .sm = sm, .time = false });
+        };
+    };
+    for ([_]usize{ 1056, 6000, 16500, 32769, 65536, 131072 }) |n| {
+        const rb = dsv41.prompt.rowBlock(4096, n);
+        try list.append(a, .{ .n = n, .rows = @min(rb, max_rows, max_keys / n), .vm = .ramp, .sm = .gauss, .time = true });
+    }
+
+    for (list.items) |c| {
+        const n = c.n;
+        const rows = c.rows;
+        const nt = (n + tri_index.tile - 1) / tri_index.tile;
+        const keys = try a.alloc(i64, rows * n);
+        defer a.free(keys);
+        const tmax = try a.alloc(i64, rows * nt);
+        defer a.free(tmax);
+        const vis = try a.alloc(i64, rows);
+        defer a.free(vis);
+        const vals = [_]f32{ 0.0, 1.0, 2.5, -0.0 };
+        for (0..rows) |row| {
+            const v = visOf(c.vm, n, rows, row);
+            vis[row] = @intCast(v);
+            for (0..n) |p| {
+                const sc: f32 = if (p >= v) -std.math.inf(f32) else switch (c.sm) {
+                    .gauss => gauss(r) * 3.0,
+                    .ties => vals[r.uintLessThan(usize, vals.len)],
+                    .zero => 0.0,
+                };
+                keys[row * n + p] = keyOf(sc, p);
+            }
+            for (0..nt) |j| {
+                var m: i64 = std.math.minInt(i64);
+                for (j * tri_index.tile..@min(n, (j + 1) * tri_index.tile)) |p| m = @max(m, keys[row * n + p]);
+                tmax[row * nt + j] = m;
+            }
+        }
+        // host reference: the k largest keys' positions sorted ascending, -1 at or past vis
+        const ref = try a.alloc(i64, rows * kk);
+        defer a.free(ref);
+        {
+            const tmp = try a.alloc(i64, n);
+            defer a.free(tmp);
+            for (0..rows) |row| {
+                @memcpy(tmp, keys[row * n ..][0..n]);
+                std.mem.sortUnstable(i64, tmp, {}, std.sort.desc(i64));
+                const o = ref[row * kk ..][0..kk];
+                for (o, tmp[0..kk]) |*x, key| x.* = @intCast(0xFFFFFFFF - (@as(u64, @bitCast(key)) & 0xFFFFFFFF));
+                std.mem.sortUnstable(i64, o, {}, std.sort.asc(i64));
+                for (o) |*x| {
+                    if (x.* >= vis[row]) x.* = -1;
+                }
+            }
+        }
+        try b_keys.upload(0, std.mem.sliceAsBytes(keys));
+        try b_tmax.upload(0, std.mem.sliceAsBytes(tmax));
+        try b_vis.upload(0, std.mem.sliceAsBytes(vis));
+        const pr = tri_index.prunes(n, kk);
+        const engine_tsel = pr or !tri_index.fusedSelect(n, kk, n, rows);
+        if (engine_tsel) used += 1;
+        const pb: tri_index.PrunedBufs = .{ .tpos = b_tpos.ptr, .cand = b_cand.ptr, .every = b_every.ptr };
+        var tk = topk;
+        tk.top = b_top.ptr;
+        // today's chain (a missing kit variant: compared with the host reference alone)
+        var chain_ok = true;
+        var chain_err: []const u8 = "";
+        tri_index.topkSelectPruned(t, b_keys.ptr, n, b_tmax.ptr, kk, b_vis.ptr, b_oa.ptr, pb, tk, rows, n) catch |err| {
+            chain_ok = false;
+            chain_err = @errorName(err);
+        };
+        try attn.tsel(&ak, s, b_keys.ptr, n, n, if (pr) b_tmax.ptr else null, nt, b_vis.ptr, b_ob.ptr, rows);
+        try s.synchronize();
+        const ob = try a.alloc(i64, rows * kk);
+        defer a.free(ob);
+        try b_ob.download(0, std.mem.sliceAsBytes(ob));
+        const same_ref = std.mem.eql(i64, ob, ref);
+        var same_chain = false;
+        if (chain_ok) {
+            const oa = try a.alloc(i64, rows * kk);
+            defer a.free(oa);
+            try b_oa.download(0, std.mem.sliceAsBytes(oa));
+            same_chain = std.mem.eql(i64, ob, oa);
+            if (!std.mem.eql(i64, oa, ref)) try out.interface.print("{{\"note\": \"chain differs from the host reference\", \"n\": {d}, \"rows\": {d}}}\n", .{ n, rows });
+        } else no_chain += 1;
+        var ms_chain: f32 = -1;
+        var ms_tsel: f32 = -1;
+        if (c.time and chain_ok) {
+            for (0..2) |_| { // warm, then 5 iterations each
+                try e0.record(s);
+                for (0..5) |_| try tri_index.topkSelectPruned(t, b_keys.ptr, n, b_tmax.ptr, kk, b_vis.ptr, b_oa.ptr, pb, tk, rows, n);
+                try e1.record(s);
+                for (0..5) |_| try attn.tsel(&ak, s, b_keys.ptr, n, n, if (pr) b_tmax.ptr else null, nt, b_vis.ptr, b_ob.ptr, rows);
+                try e2.record(s);
+                try s.synchronize();
+                ms_chain = try cuda.Event.elapsedMs(e0, e1) / 5;
+                ms_tsel = try cuda.Event.elapsedMs(e1, e2) / 5;
+            }
+        }
+        cases += 1;
+        if (same_ref) eq_ref += 1;
+        if (same_chain) eq_chain += 1;
+        try out.interface.print("{{\"n\": {d}, \"rows\": {d}, \"vis\": \"{s}\", \"scores\": \"{s}\", \"pruned\": {}, \"engine_takes_tsel\": {}, \"equal_chain\": {}, \"equal_ref\": {}, \"chain\": \"{s}\"", .{ n, rows, @tagName(c.vm), @tagName(c.sm), pr, engine_tsel, same_chain, same_ref, if (chain_ok) "ok" else chain_err });
+        if (c.time) try out.interface.print(", \"ms_chain\": {d:.4}, \"ms_tsel\": {d:.4}", .{ ms_chain, ms_tsel });
+        try out.interface.print("}}\n", .{});
+        try out.interface.flush();
+    }
+    const ok = eq_ref == cases and eq_chain + no_chain == cases;
+    try out.interface.print("{{\"summary\": true, \"cases\": {d}, \"engine_takes_tsel\": {d}, \"equal_ref\": {d}, \"equal_chain\": {d}, \"chain_unavailable\": {d}, \"ok\": {}}}\n", .{ cases, used, eq_ref, eq_chain, no_chain, ok });
+    try out.interface.flush();
+    return if (ok) 0 else 1;
 }

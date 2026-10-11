@@ -58,6 +58,13 @@
 //!                                               scores, top-k) on the owned rows, their outputs gathered (attn.zig);
 //!                                               with TF_DS_PROMPT_OVL, fronts qr / kv gather takes xags place on
 //!                                               its layers on the comm stream, in the same launch order (stage ZC2)
+//!   TF_DS_PROMPT_ATTN=...,tsel                  (in all; any prompt chunk) the indexer's keyed top-k in one launch a
+//!                                               row (attn_prompt.cu tf_ds_tsel_kernel, its bin scan fixed in stage
+//!                                               ZT2) in place of topk_select's torch / pruned chain; no comm
+//!   TF_DS_PROMPT_ROUTER=own[,hide]|all          with SP rows: the MoE router on the owned rows of 2,048-row chunks
+//!                                               and 4,096-row passes (today's cuBLAS run's split-K arithmetic,
+//!                                               found and checked at start), picks and weights gathered; hide (needs
+//!                                               TF_DS_PROMPT_OVL) runs the FFN x gather under it (router.zig)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the

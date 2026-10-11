@@ -8,8 +8,10 @@
 // past vis[r], and so does this kernel. The pruned chain's set is the row's k largest keys (kernels.py
 // topk_select_pruned: every one of them lies in one of the k tiles with the largest maxima); here those tiles are the
 // ones whose maximum is at least T, the k-th largest maximum (the maxima are keys too: unique), and the k largest keys
-// are found among their keys. (A tile past n has no real key: the chain's PAD keys never reach a set of k real keys,
-// and nt > k tiles hold at least k real keys each above... every selected tile's maximum is a real key >= T.)
+// are found among their keys. (The prompt's scores run without DEAD_PAD, so every key t < n is written and every tile
+// maximum is a real key of its tile. Exactly k tiles have a maximum >= T, each holds at least one real key, so the
+// chain's k gathered tiles hold at least k real keys and its PAD fill (positions >= n of the last tile) never enters
+// the set; this kernel reads only positions < n.)
 //
 // The selection: a radix select from the top, 12 bits on the first pass over the keys in global memory (L2 / DRAM),
 // then, once the bin that holds the k-th largest has at most kCand keys, one pass that keeps the keys above that bin
@@ -82,8 +84,20 @@ struct CandSrc {
   }
 };
 
-// One pass: the histogram of the next `bits` bits below `shift` of the values matching the prefix, then the bin holding
-// the want-th largest of them (warp 0: each lane a run of bins from the top, a prefix sum over lanes).
+// A broken invariant (fewer values than k, or values not unique): stop the kernel with an error the stream reports
+// (cudaErrorLaunchFailure at the next synchronization) instead of looping or writing past the shared arrays. Never
+// taken on the indexer's keys (unique, n >= k: the launcher refuses n < k).
+__device__ __forceinline__ void broken() { __trap(); }
+
+// One pass: the histogram of the next `bits` bits (1 .. 12) below `shift` of the values matching the prefix, then the
+// bin holding the want-th largest of them (warp 0: each lane a run of ceil(nb / 32) bins from the top, a prefix sum
+// over lanes). Every pass narrows the prefix by `bits` bits (shift strictly falls) or traps: the callers' loops end.
+//
+// (Stage ZT2: ZT1's lanes took nb / 32 bins each, which is 0 for nb < 32. The 8-bit passes on the candidates run
+// from shift 52 (64 - 12) down to 4, so every selection ended with a 4-bit pass (nb 16) in which no lane held a
+// bin: nothing claimed the want-th value, shift stayed 4, and `while (s.shift > 0) pass(..)` spun forever. That is
+// arm TA's hang: the first chunk whose indexer selection took tsel (4,224-token prompt: its second chunk, 1,056
+// compressed keys, not a power of two) never finished, and every rank waited on it.)
 template <class Src>
 __device__ void pass(Smem& s, const Src& src, int bits) {
   const int nb = 1 << bits;
@@ -97,10 +111,11 @@ __device__ void pass(Smem& s, const Src& src, int bits) {
   __syncthreads();
   if (threadIdx.x < 32) {
     const int l = threadIdx.x;
-    const int per = nb / 32;
-    const int hi = nb - 1 - l * per;    // this lane's bins: hi, hi - 1, .., hi - per + 1
+    const int per = (nb + 31) / 32;     // >= 1 for any nb (nb a power of two: lanes past nb / per hold none)
+    const int hi = nb - 1 - l * per;    // this lane's bins: hi, hi - 1, .., max(hi - per + 1, 0)
+    const int lo = hi - per + 1 > 0 ? hi - per + 1 : 0;
     unsigned int sum = 0;
-    for (int b = 0; b < per; ++b) sum += s.hist[hi - b];
+    for (int b = hi; b >= lo; --b) sum += s.hist[b];
     unsigned int incl = sum;
     for (int o = 1; o < 32; o <<= 1) {
       const unsigned int v = __shfl_up_sync(0xffffffffu, incl, o);
@@ -110,10 +125,10 @@ __device__ void pass(Smem& s, const Src& src, int bits) {
     const unsigned int want = (unsigned int)s.want;
     const bool here = excl < want && incl >= want;
     const unsigned int ballot = __ballot_sync(0xffffffffu, here);
-    if (here && l == __ffs(ballot) - 1) {
+    if (here && l == __ffs(ballot) - 1) {   // (incl rises with l: at most one lane, sum > 0 so hi >= lo)
       unsigned int w = want - excl;
       int b = hi;
-      for (;; --b) {
+      for (; b > lo; --b) {
         const unsigned int h = s.hist[b];
         if (h >= w) break;
         w -= h;
@@ -126,6 +141,9 @@ __device__ void pass(Smem& s, const Src& src, int bits) {
     }
   }
   __syncthreads();
+  // no lane claimed a bin: fewer than want values match the prefix (s.shift is written again only after the next
+  // pass's two barriers, so every thread reads this pass's value)
+  if (s.shift != sh) broken();
 }
 
 // Keeps the values above the prefix's range (selected) and those in it (candidates) in shared memory.
@@ -137,16 +155,22 @@ __device__ void collect(Smem& s, const Src& src, bool into_cand) {
   __syncthreads();
   src([&](u64 u) {
     if (u > top) {
-      s.sel[atomicAdd(&s.nsel, 1)] = u;
+      const int i = atomicAdd(&s.nsel, 1);
+      if (i < kK) s.sel[i] = u;
     } else if ((u & mask) == prefix) {
       if (into_cand) {
-        s.cand[atomicAdd(&s.done, 1)] = u;
+        const int i = atomicAdd(&s.done, 1);
+        if (i < kCand) s.cand[i] = u;
       } else {
-        s.sel[atomicAdd(&s.nsel, 1)] = u;  // the last value (shift 0): the k-th largest itself
+        const int i = atomicAdd(&s.nsel, 1);  // the last value (shift 0): the k-th largest itself
+        if (i < kK) s.sel[i] = u;
       }
     }
   });
   __syncthreads();
+  // the last collect holds exactly k values; before it fewer than k are above the candidates' bin (unique values:
+  // never taken)
+  if (into_cand ? (s.nsel >= kK || s.done > kCand) : s.nsel != kK) broken();
 }
 
 // The k largest values of src (unique) into s.sel[0 .. k).

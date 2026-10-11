@@ -39,6 +39,7 @@ const rdma = @import("rdma.zig");
 const pprof = @import("pprof.zig");
 const ovl = @import("ovl.zig");
 const attn = @import("attn.zig");
+const router = @import("router.zig");
 
 /// The indexer's [rows, n_comp] keys a row block holds at most (model.py: rb * n_comp <= 2^26 / 4 past 16 rows).
 const key_elems: usize = 1 << 24;
@@ -135,6 +136,7 @@ pub const Engine = struct {
     prof: ?*pprof.Prof = null, // TF_DS_PROMPT_PROF=1: the chunk's phase marks (set by fillChunk for the chunk alone)
     side: ?*ovl.Side = null, // TF_DS_PROMPT_OVL: the comm stream (set by fillChunk for an SP chunk alone; null: as served)
     attn: ?*const attn.State = null, // TF_DS_PROMPT_ATTN (attn.zig): its levers; null: as served
+    router: ?*const router.State = null, // TF_DS_PROMPT_ROUTER (router.zig): own-row routing; null: as served
 
     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.
@@ -352,6 +354,10 @@ pub const Chunk = struct {
     // TF_DS_PROMPT_OVL=fxag (spGatherFfn -> moe): the FFN x all-gather's first exchange (with the row partner) is on the
     // comm stream; moe issues the second and the router's runs around it
     fxag_sent: bool = false,
+    // TF_DS_PROMPT_ROUTER=own (ffnMixes -> moe): ffnMixes routed this node's rows and gathered every owner's picks and
+    // weights (moe skips the router); rpw: int32 / fp32 words [cap, 2 slots] the gather's staging (own only, else 0)
+    routed: bool = false,
+    rpw: u64 = 0,
 
     /// Every buffer for `cap` rows from `a`, the compressed layers' for chunks ending by position `tokens`; the scratch
     /// the served build zeros (or fills with -1) is set the same.
@@ -375,6 +381,8 @@ pub const Chunk = struct {
         ch.pending = false;
         ch.sub_rows = 0;
         ch.sp = null;
+        ch.routed = false;
+        ch.rpw = 0;
         ch.ids = try a.take(cap * 8);
         ch.pos0 = try a.take(cap * 8);
         ch.pos = ch.pos0;
@@ -545,6 +553,10 @@ pub const Chunk = struct {
         var had: [128 * 128]u16 = undefined;
         exl3_prefill.hadamard(&had);
         try upload(e, ch.ws.h, &had, had.len * 2);
+        // TF_DS_PROMPT_ROUTER=own: the picks' gather staging, last (every other buffer where it is without the lever)
+        if (e.router) |r| if (r.lv.own) {
+            ch.rpw = try a.take(cap * 2 * sl * 4);
+        };
         return ch;
     }
 };
@@ -757,6 +769,7 @@ pub fn begin(e: *const Engine, ch: *Chunk, ids: []const i64, start: usize, host_
     ch.engram_staged = null;
     ch.pm_sent = .none;
     ch.fxag_sent = false;
+    ch.routed = false;
     for (host_pos[0..n], 0..) |*p, i| p.* = @intCast(start + i);
     try upload(e, ch.ids, ids.ptr, n * 8);
     ch.pos = ch.pos0;
@@ -1565,6 +1578,24 @@ pub fn ffnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     const src = try tri_hc.hcPrePf(e.t, v.h, lay.hc_ffn[0], lay.hc_ffn[1], lay.hc_ffn[2], v.pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, v.x, v.pre_f, v.post, v.comb, ch.part, .{ .gathered = ch.ga, .world = e.world, .h_out = v.h_alt }, v.rows, c.hidden);
     swapStreams(ch, if (src == v.h_alt) ch.h_alt else src);
     try pm(e, .mix);
+    if (routerOwnOn(e, ch)) {
+        // TF_DS_PROMPT_ROUTER=own: this node's rows routed here (they are this node's mixes' output), every owner's picks
+        // and weights gathered; with hide the x gather runs on the comm stream meanwhile (the picks' gather waits for it
+        // in comm.Order, and the join below makes every x row visible to the experts)
+        const side: ?*ovl.Side = if (e.router.?.lv.hide) e.side else null;
+        if (side) |sd| {
+            try sd.fork(e.s);
+            try ffnGatherX(e, ch, sd.stream);
+            try sd.end(.rag);
+        }
+        try routeOwn(e, ch, li);
+        if (side) |sd| {
+            try sd.join(e.s, .rag);
+        } else try ffnGatherX(e, ch, e.s);
+        try pm(e, .comm);
+        ch.routed = true;
+        return;
+    }
     if (e.side) |sd| if (sd.lv.fxag) if (ch.sp) |sp| if (ovl.fxagFits(sp.owners(), ch.sub_rows)) {
         // TF_DS_PROMPT_OVL=fxag: the all-gather's first step, this node's rows with the row partner, on the comm stream
         const d = e.c.hidden;
@@ -1593,6 +1624,9 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
         // a decode-sized chunk: the row-invariant gate (rowmm_gate's chunk sums) and its routing
         kc = try tri_norm.rowmmGate(e.t, ch.x, d, lay.gate_w, ch.gl, n, d, c.experts);
         try tri_norm.route(e.t, ch.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
+    } else if (ch.routed) {
+        // TF_DS_PROMPT_ROUTER=own: ffnMixes routed this node's rows and gathered every owner's picks and weights
+        ch.routed = false;
     } else if (ch.fxag_sent) {
         // TF_DS_PROMPT_OVL=fxag: gate_w's conversion under the first exchange; then the pair's rows (this pair's 2,048-row
         // run) converted and through the router under the second (the pair's rows to the column partner, the other
@@ -1633,6 +1667,66 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
     // routed(): a chunk of fewer than EXACT_ROWS rows takes the decode window's fused path and scratch
     if (n < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
     try exl3_experts.prompt(e.ex, e.s, lay.experts, ch.xs, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
+}
+
+/// TF_DS_PROMPT_ROUTER=own's FFN x gather on stream `s` (every owner's x rows to every node, in place): with
+/// TF_DS_PROMPT_OVL=fxag on a pass it fits, fxag's two exchanges back to back (this node's rows with the row partner,
+/// then the pair's rows with the column partner; one stream keeps their order), else the all-gather (and rows2's tail)
+/// as spGatherX issues it. The same bytes either way; the choice depends on n, sub_rows and the env alone.
+fn ffnGatherX(e: *const Engine, ch: *const Chunk, s: cuda.Stream) !void {
+    const sp = ch.sp orelse return error.NoSpRows;
+    const d = e.c.hidden;
+    const o = sp.owners();
+    if (e.side) |sd| if (sd.lv.fxag) if (ovl.fxagFits(o, ch.sub_rows)) {
+        const g: u32 = @intCast(sp.g);
+        const pr = sp.g / 2;
+        const sub = ch.sub_rows;
+        try e.comm.exchange(ch.x + o.r0(sp.g) * d * 2, o.q * d, ch.x + o.r0(sp.g ^ 1) * d * 2, o.q * d, .bf16, g ^ 1, s);
+        try e.comm.exchange(ch.x + pr * sub * d * 2, sub * d, ch.x + (1 - pr) * sub * d * 2, (o.n - sub) * d, .bf16, g ^ 2, s);
+        return;
+    };
+    try e.comm.allGather(ch.x + sp.g * sp.q * d * 2, ch.x, sp.q * d, .bf16, s);
+    try spTail(e, sp, ch.x, d * 2, s);
+}
+
+/// TF_DS_PROMPT_ROUTER=own: whether this chunk routes on owned rows: an SP chunk (encoder layers, no image span)
+/// whose owners each lie inside one of the router's 2,048-row cuBLAS runs (router.fits: n and the sub-runs alone, so
+/// the same answer on every rank).
+pub fn routerOwnOn(e: *const Engine, ch: *const Chunk) bool {
+    const r = e.router orelse return false;
+    if (!r.lv.own or r.k == null) return false;
+    const sp = ch.sp orelse return false;
+    if (ch.n <= tri.decode_rows or ch.spans.len != 0) return false;
+    return router.fits(sp.owners(), ch.sub_rows);
+}
+
+/// TF_DS_PROMPT_ROUTER=own's routing of this node's rows [r0, r0 + rows): their logits by router_own.cu from x bf16
+/// and gate_w fp16 widened in the program as today's casts do (today's 2,048-row run's arithmetic, router.calibrate),
+/// the route kernel on them (one program a row: the bytes today's whole launch writes for them); then each owner's picks and weights, side
+/// by side in rpw [n, 2 slots], all-gathered in place (and rows2's tail by send / recv) and put back into pick / wts.
+/// Every row's pick / wts then hold the bytes today's router leaves.
+pub fn routeOwn(e: *const Engine, ch: *Chunk, li: usize) !void {
+    const lay = e.w.layers[li];
+    const c = e.c;
+    const d = c.hidden;
+    const sl = e.slots();
+    const r = e.router orelse return error.NoRouterLever;
+    const k = r.k orelse return error.NoRouterLever;
+    const sp = ch.sp orelse return error.NoSpRows;
+    const o = sp.owners();
+    const r0 = o.r0(sp.g);
+    const rows = o.rows(sp.g);
+    const shared_id = lay.experts.count - 1;
+    try router.own(k, e.s, .h, router.variantFor(rows, c.experts), ch.x + r0 * d * 2, d, lay.gate_w, ch.logits + r0 * c.experts * 4, rows, d, c.experts, r.parts);
+    try tri_norm.route(e.t, ch.logits + r0 * c.experts * 4, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick + r0 * sl * 4, ch.wts + r0 * sl * 4, rows, c.experts, sl);
+    try pm(e, .router);
+    const row = sl * 4;
+    try e.ops.copyRows(e.s, ch.pick + r0 * row, row, ch.rpw + r0 * 2 * row, 2 * row, row, rows);
+    try e.ops.copyRows(e.s, ch.wts + r0 * row, row, ch.rpw + r0 * 2 * row + row, 2 * row, row, rows);
+    try gatherOwn(e, sp, ch.rpw, 2 * row, e.s);
+    try e.ops.copyRows(e.s, ch.rpw, 2 * row, ch.pick, row, row, ch.n);
+    try e.ops.copyRows(e.s, ch.rpw + row, 2 * row, ch.wts, row, row, ch.n);
+    try pm(e, .comm);
 }
 
 /// The VL routing (Gate.forward's bias = where(image_mask, bias_vl, bias)) as the served build runs it (recording v0's

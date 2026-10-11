@@ -160,15 +160,17 @@ pub fn fxagFits(o: Owners, sub_rows: usize) bool {
     return o.valid() and sub_rows != 0 and o.n == 2 * sub_rows and 2 * o.q == sub_rows and o.rows(3) == o.q;
 }
 
-/// What a side segment's completion event is for (each kind has at most one segment in flight).
-pub const Kind = enum(u8) { xag, engram, wob, pack, dn, fxag };
+/// What a side segment's completion event is for (each kind has at most one segment in flight). rag: the FFN x
+/// all-gather under the own rows' router (TF_DS_PROMPT_ROUTER=own,hide; router.zig).
+pub const Kind = enum(u8) { xag, engram, wob, pack, dn, fxag, rag };
+const kinds = std.meta.tags(Kind).len;
 
 /// The comm stream, its handoff events and the launch order (model.Model.side; set on the engine for SP chunks only).
 pub const Side = struct {
     lv: Levers,
     stream: cuda.Stream,
     go: cuda.Event, // compute -> comm: recorded on the compute stream right before a segment, waited for by the comm stream
-    done: [6]cuda.Event, // comm -> compute, one per Kind: recorded after a segment, waited for where its result is read
+    done: [kinds]cuda.Event, // comm -> compute, one per Kind: recorded after a segment, waited for where its result is read
     order: comm.Order,
     segments: u64 = 0, // side segments issued (diagnosis)
 
@@ -177,7 +179,7 @@ pub const Side = struct {
         errdefer s.deinit();
         var go = try cuda.Event.init(d, false);
         errdefer go.deinit();
-        var done: [6]cuda.Event = undefined;
+        var done: [kinds]cuda.Event = undefined;
         var made: usize = 0;
         errdefer for (done[0..made]) |*x| x.deinit();
         for (&done) |*x| {

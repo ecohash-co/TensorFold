@@ -12,6 +12,22 @@
 //!           on the comm stream, wo_b for the own rows meanwhile; the copies after it wait for it
 //!   prio    the comm stream at the context's greatest priority (its NCCL blocks dispatch first)
 //!
+//! The expert side (stage ZX1; TF_DS_EXL3_PROMPT=v2, not in `all`):
+//!   pack    the expert pack exchange with the column partner in two parts at the pack's seam: gate / up's main
+//!           columns and their epilogue first, the main rows on the comm stream under the rest block's gate / up and
+//!           its epilogue, then the rest rows; assemble waits (needs TF_DS_2D_GU=parity)
+//!   dn      down and its combine in two column halves: half A's GEMM, combine of the other owners' rows, half A's
+//!           toOwners on the comm stream under half B's GEMM and combine, half B's toOwners, then both halves' combine of
+//!           this node's own rows under it; the MoE partial lands half-major [2, n, dn / 2] and gather's copies put
+//!           every element where today's do (the halves' svh_d tables copied once at load)
+//!   dnc     (without dn's halves) the combine of the other owners' rows first, toOwners on the comm stream, this
+//!           node's own rows' combine under it
+//!   fxag    the FFN mixes' x all-gather as two exchanges on the comm stream (with the row partner, then the pair's
+//!           rows with the column partner): on a 4,096-row pass the pair's rows are exactly one of the router's 2,048-row
+//!           cuBLAS runs, so that run (and its rows' fp32 conversion, and gate_w's) runs here under the second exchange;
+//!           the same calls on the same rows, only their order changes (a run of other M would change bits: cuBLAS
+//!           picks a split-K by M, measured in stage ZX1)
+//!
 //! One NCCL communicator; comm.Order keeps every NCCL operation of the chunk in host issue order on the GPU whichever
 //! stream it went on, and the ranks issue the same operations in the same order (every choice here depends only on the
 //! chunk's n, start, replay and spans and the env), so no ordering hazard (ZP2's two-communicator deadlock) exists.
@@ -26,15 +42,24 @@ pub const Levers = struct {
     xag: bool = false,
     wob: bool = false,
     prio: bool = false,
+    pack: bool = false,
+    dn: bool = false,
+    dnc: bool = false,
+    fxag: bool = false,
 
     pub fn any(l: Levers) bool {
-        return l.engram or l.xag or l.wob;
+        return l.engram or l.xag or l.wob or l.pack or l.dn or l.dnc or l.fxag;
+    }
+
+    /// Any expert-side lever (they need TF_DS_EXL3_PROMPT=v2's down and gate / up).
+    pub fn experts(l: Levers) bool {
+        return l.pack or l.dn or l.dnc;
     }
 
     /// The names of the active levers, as the start line prints them.
     pub fn names(l: Levers, buf: []u8) []const u8 {
         var n: usize = 0;
-        inline for (.{ "engram", "xag", "wob", "prio" }) |f| if (@field(l, f)) {
+        inline for (.{ "engram", "xag", "wob", "prio", "pack", "dn", "dnc", "fxag" }) |f| if (@field(l, f)) {
             if (n > 0 and n < buf.len) {
                 buf[n] = ',';
                 n += 1;
@@ -48,20 +73,22 @@ pub const Levers = struct {
 };
 
 /// TF_DS_PROMPT_OVL's value: unset, "" or "off": none (today's launches); else a comma list of engram, xag, wob, prio,
-/// or "all" (engram, xag, wob); "prio" alone (no lever) is refused, as is any other word.
+/// pack, dn, dnc, fxag, or "all" (engram, xag, wob); "prio" alone (no lever) is refused, as is any other word, and "dn" with
+/// "dnc" (dn's halves already combine the own rows last).
 pub fn parse(v: ?[]const u8) !Levers {
     const s = v orelse return .{};
     if (s.len == 0 or std.mem.eql(u8, s, "off")) return .{};
     var l: Levers = .{};
     var it = std.mem.splitScalar(u8, s, ',');
     while (it.next()) |w| {
-        if (std.mem.eql(u8, w, "engram")) l.engram = true else if (std.mem.eql(u8, w, "xag")) l.xag = true else if (std.mem.eql(u8, w, "wob")) l.wob = true else if (std.mem.eql(u8, w, "prio")) l.prio = true else if (std.mem.eql(u8, w, "all")) {
+        if (std.mem.eql(u8, w, "engram")) l.engram = true else if (std.mem.eql(u8, w, "xag")) l.xag = true else if (std.mem.eql(u8, w, "wob")) l.wob = true else if (std.mem.eql(u8, w, "prio")) l.prio = true else if (std.mem.eql(u8, w, "pack")) l.pack = true else if (std.mem.eql(u8, w, "dn")) l.dn = true else if (std.mem.eql(u8, w, "dnc")) l.dnc = true else if (std.mem.eql(u8, w, "fxag")) l.fxag = true else if (std.mem.eql(u8, w, "all")) {
             l.engram = true;
             l.xag = true;
             l.wob = true;
         } else return error.BadPromptOvl;
     }
     if (!l.any()) return error.BadPromptOvl;
+    if (l.dn and l.dnc) return error.BadPromptOvl;
     return l;
 }
 
@@ -94,15 +121,41 @@ pub fn engramAhead(engram_layers: []const u16, li: usize, cut: usize) ?usize {
     return nx;
 }
 
+/// Rows [0, n) of a chunk in three parts for a row-local launch on node me, the other owners' rows first: [before
+/// this node's rows, after them, this node's own] (any may be empty). For kernels with one block a row (the served
+/// down_combine), where no row's bytes depend on which rows share a launch, so there is no size rule. null when the
+/// owners are not valid.
+pub fn othersFirst(o: Owners, me: usize) ?[3]Range {
+    if (!o.valid() or me > 3) return null;
+    const r0 = o.r0(me);
+    const rm = o.rows(me);
+    return .{ .{ .r0 = 0, .rows = r0 }, .{ .r0 = r0 + rm, .rows = o.n - r0 - rm }, .{ .r0 = r0, .rows = rm } };
+}
+
+/// TF_DS_PROMPT_OVL=dn's column halves of down's output (dn columns here, the same on every node): the half's width, or
+/// null when the halves would not keep today's launch shape (each half whole 256-column programs, as dn's are, so every
+/// launch takes the same entry with the same program width).
+pub fn dnHalf(dn: usize) ?usize {
+    if (dn % 512 != 0) return null;
+    return dn / 2;
+}
+
+/// TF_DS_PROMPT_OVL=fxag: whether a chunk's FFN x all-gather splits into the row-partner and column-partner exchanges
+/// with the router's runs falling on the pairs' rows: a pass of two sub-runs (sub_rows; the router runs per sub-run)
+/// of n = 2 sub_rows rows, four equal owners (q = sub_rows / 2), so pair p's rows [2 p q, + 2 q) are run p exactly.
+pub fn fxagFits(o: Owners, sub_rows: usize) bool {
+    return o.valid() and sub_rows != 0 and o.n == 2 * sub_rows and 2 * o.q == sub_rows and o.rows(3) == o.q;
+}
+
 /// What a side segment's completion event is for (each kind has at most one segment in flight).
-pub const Kind = enum(u8) { xag, engram, wob };
+pub const Kind = enum(u8) { xag, engram, wob, pack, dn, fxag };
 
 /// The comm stream, its handoff events and the launch order (model.Model.side; set on the engine for SP chunks only).
 pub const Side = struct {
     lv: Levers,
     stream: cuda.Stream,
     go: cuda.Event, // compute -> comm: recorded on the compute stream right before a segment, waited for by the comm stream
-    done: [3]cuda.Event, // comm -> compute, one per Kind: recorded after a segment, waited for where its result is read
+    done: [6]cuda.Event, // comm -> compute, one per Kind: recorded after a segment, waited for where its result is read
     order: comm.Order,
     segments: u64 = 0, // side segments issued (diagnosis)
 
@@ -111,7 +164,7 @@ pub const Side = struct {
         errdefer s.deinit();
         var go = try cuda.Event.init(d, false);
         errdefer go.deinit();
-        var done: [3]cuda.Event = undefined;
+        var done: [6]cuda.Event = undefined;
         var made: usize = 0;
         errdefer for (done[0..made]) |*x| x.deinit();
         for (&done) |*x| {
@@ -168,6 +221,75 @@ test "TF_DS_PROMPT_OVL: unset / off is today's; lists, all, and bad words fail" 
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("engram,xag,wob,prio", (try parse("all,prio")).names(&buf));
     try std.testing.expectEqualStrings("wob", (try parse("wob")).names(&buf));
+}
+
+test "TF_DS_PROMPT_OVL: the expert-side words (not in all), dn with dnc refused" {
+    try std.testing.expectEqual(Levers{ .pack = true }, try parse("pack"));
+    try std.testing.expectEqual(Levers{ .dn = true }, try parse("dn"));
+    try std.testing.expectEqual(Levers{ .dnc = true }, try parse("dnc"));
+    try std.testing.expectEqual(Levers{ .engram = true, .xag = true, .wob = true, .pack = true, .dn = true }, try parse("all,pack,dn"));
+    try std.testing.expectEqual(Levers{ .engram = true, .xag = true, .wob = true }, try parse("all"));
+    try std.testing.expect(!(try parse("all")).experts());
+    try std.testing.expect((try parse("dnc")).experts());
+    try std.testing.expectError(error.BadPromptOvl, parse("dn,dnc"));
+    try std.testing.expectError(error.BadPromptOvl, parse("down"));
+    try std.testing.expectError(error.BadPromptOvl, parse("pack,"));
+    try std.testing.expectError(error.BadPromptOvl, parse("prio,"));
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("engram,xag,wob,prio,pack,dn", (try parse("all,prio,pack,dn")).names(&buf));
+    try std.testing.expectEqualStrings("dnc", (try parse("dnc")).names(&buf));
+    try std.testing.expectEqual(Levers{ .fxag = true }, try parse("fxag"));
+    try std.testing.expect(!(try parse("fxag")).experts());
+}
+
+test "othersFirst: the other owners' rows, then this node's, every row once, every chunk size" {
+    var n: usize = 64;
+    while (n <= 4096) : (n += 16) {
+        const o = Owners.of(n);
+        for (0..4) |me| {
+            const got = othersFirst(o, me);
+            try std.testing.expectEqual(o.valid(), got != null);
+            const ps = got orelse continue;
+            try std.testing.expectEqual(o.r0(me), ps[2].r0);
+            try std.testing.expectEqual(o.rows(me), ps[2].rows);
+            var hit: [4096]u8 = @splat(0);
+            for (ps) |p| for (p.r0..p.r0 + p.rows) |r| {
+                hit[r] += 1;
+            };
+            for (hit[0..n]) |h| try std.testing.expectEqual(@as(u8, 1), h);
+            // the first two parts are exactly the rows toOwners sends (every other owner's), the last its own
+            for (0..n) |r| {
+                const own = r >= o.r0(me) and r < o.r0(me) + o.rows(me);
+                const in_last = r >= ps[2].r0 and r < ps[2].r0 + ps[2].rows;
+                try std.testing.expectEqual(own, in_last);
+            }
+        }
+    }
+}
+
+test "fxagFits: only the 4,096-row pass of two 2,048-row runs, whose pairs' rows are the runs" {
+    try std.testing.expect(fxagFits(Owners.of(4096), 2048));
+    try std.testing.expect(!fxagFits(Owners.of(4096), 0)); // one run of 4,096 rows (no sub-runs)
+    try std.testing.expect(!fxagFits(Owners.of(2048), 0));
+    try std.testing.expect(!fxagFits(Owners.of(2048), 2048));
+    var n: usize = 256;
+    while (n <= 4096) : (n += 64) {
+        const o = Owners.of(n);
+        for ([_]usize{ 0, 1024, 2048 }) |sub| if (fxagFits(o, sub)) {
+            // pair p's rows are sub-run p exactly
+            for (0..2) |p| {
+                try std.testing.expectEqual(p * sub, o.r0(2 * p));
+                try std.testing.expectEqual(sub, o.rows(2 * p) + o.rows(2 * p + 1));
+            }
+        };
+    }
+}
+
+test "dnHalf: halves of whole 256-column programs, else none" {
+    try std.testing.expectEqual(@as(?usize, 1280), dnHalf(2560));
+    try std.testing.expectEqual(@as(?usize, 256), dnHalf(512));
+    try std.testing.expectEqual(@as(?usize, null), dnHalf(2304));
+    try std.testing.expectEqual(@as(?usize, null), dnHalf(1280 + 128));
 }
 
 test "ownFirst: own rows first, the rest before and after, every row once; null where a part would leave the prompt GEMM" {

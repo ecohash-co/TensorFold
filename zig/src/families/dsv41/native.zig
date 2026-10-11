@@ -41,6 +41,13 @@
 //!   TF_DS_PROMPT_OVL=engram,xag,wob[,prio]|all  with SP rows: an SP chunk's exchanges on a comm stream under compute
 //!                                               that does not read them yet, one NCCL communicator in one launch
 //!                                               order (ovl.zig; engram needs TF_DS_PROMPT_ENGRAM=sp)
+//!   TF_DS_PROMPT_OVL=...,pack,dn|dnc            the expert side (stage ZX1, not in all; TF_DS_EXL3_PROMPT=v2): the
+//!                                               pack exchange in two parts under the rest block (pack, needs parity),
+//!                                               down + combine by column halves with the MoE partial's toOwners under
+//!                                               half B (dn), or the combine's own rows last (dnc)
+//!   TF_DS_PROMPT_OVL=...,fxag                   (not in all) the FFN x all-gather as row-partner + column-partner
+//!                                               exchanges on the comm stream, this pair's 2,048-row router run under
+//!                                               the second (4,096-row passes)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the

@@ -308,6 +308,104 @@ fn denseLayer(d: *const cuda.Driver, a: std.mem.Allocator, out: anytype, s: cuda
     try out.interface.flush();
 }
 
+/// TF_BENCH_XOVL: the expert-side TF_DS_PROMPT_OVL plans (pack, dnc, dn) against v2's whole launches on the same inputs
+/// (xd_full2 / pm2 hold v2's results on entry), and their launch cost (no exchange: one GPU). One JSON line.
+fn xovlCheck(d: *const cuda.Driver, a: std.mem.Allocator, out: anytype, s: cuda.Stream, tm: *Timer, k: *const P.Kernels, xk: *const X.Kernels, ops: *const dsv41.ops.Ops, ex: dsv41.weights.Experts, sc2: X.Scratch, rs2: ?X2.RestScratch, xin: u64, dd: usize, pick: u64, wts: u64, xd_full2: u64, pm2: u64, ref_xd: u64, save_xd: u64, pm3: u64, pmh: u64, svh_h: u64, n: usize, sl: usize, ig: usize, ir: usize, dn: usize, ne: usize, rank: u32, iters: usize, limit: f32, li: usize) !void {
+    const ovl = dsv41.ovl;
+    const p = n * sl;
+    const half = dn / 2;
+    // v2's whole gate / up -> ref_xd, then pack's split order into sc2.xd, each from a zeroed sc2.xd (the rest rows
+    // of the other pair's slots are written by neither); sc2.xd is put back as it was at the end (the v2-vs-today
+    // compare of later cases relies on both scratches' never-written rows having the same history)
+    const xd_bytes = p * (ig + ir) * 2;
+    try d.check(d.api.cuMemcpyDtoDAsync_v2(save_xd, sc2.xd, xd_bytes, s.handle), "cuMemcpyDtoDAsync");
+    try d.check(d.api.cuMemsetD8Async(sc2.xd, 0, xd_bytes, s.handle), "cuMemsetD8Async");
+    try P.gateUp(k, xk, ops, s, ex, sc2, rs2, xin, dd, pick, n, limit);
+    try d.check(d.api.cuMemcpyDtoDAsync_v2(ref_xd, sc2.xd, p * (ig + ir) * 2, s.handle), "cuMemcpyDtoDAsync");
+    // (zero: the rest rows of the other pair's slots are never written, so they stay zero as in ref_xd)
+    try d.check(d.api.cuMemsetD8Async(sc2.xd, 0, p * (ig + ir) * 2, s.handle), "cuMemsetD8Async");
+    const rest_ok = ex.rest != null;
+    if (rest_ok) {
+        try P.gateUpPart(k, xk, ops, s, ex, sc2, rs2, xin, dd, pick, n, limit, .main);
+        try P.gateUpPart(k, xk, ops, s, ex, sc2, rs2, xin, dd, pick, n, limit, .rest);
+    } else try P.gateUp(k, xk, ops, s, ex, sc2, rs2, xin, dd, pick, n, limit);
+    try s.synchronize();
+    const c_pack = try compare(d, a, ref_xd, sc2.xd, p * (ig + ir) * 2);
+    // the down GEMM below reads xd_full2 (v2's assembled intermediate) and sc2's grouping (just rebuilt identically)
+    const o = dsv41.prompt2d.Owners.of(n);
+    const rp = ovl.othersFirst(o, rank) orelse return error.BadOwnerRows;
+    // dnc: today's down GEMM, the combine in three row parts
+    try d.check(d.api.cuMemsetD8Async(pm3, 0xa5, n * dn * 4, s.handle), "cuMemsetD8Async");
+    try P.downGemm(k, s, ex, sc2, xd_full2, n, .{ .c0 = 0, .cols = dn, .z = sc2.z, .compact = false });
+    for (rp) |r| try P.combineRows(xk, s, ex.svh_d, sc2, pick, wts, pm3, n, dn, ne, sc2.z, r.r0, r.rows);
+    try s.synchronize();
+    const c_dnc = try compare(d, a, pm2, pm3, n * dn * 4);
+    // dn: svh_d's halves (model.dnTables), each half's GEMM into a compact part of sc2.z and its combine (others, own)
+    for (0..2) |h| try ops.copyRows(s, ex.svh_d + h * half * 2, dn * 2, svh_h + h * ne * half * 2, half * 2, half * 2, ne);
+    try d.check(d.api.cuMemsetD8Async(pmh, 0xa5, n * dn * 4, s.handle), "cuMemsetD8Async");
+    try d.check(d.api.cuMemsetD8Async(pm3, 0x5a, n * dn * 4, s.handle), "cuMemsetD8Async");
+    try d.check(d.api.cuMemsetD8Async(sc2.z, 0x5a, p * dn * 4, s.handle), "cuMemsetD8Async");
+    for (0..2) |h| {
+        const z = sc2.z + h * p * half * 4;
+        try P.downGemm(k, s, ex, sc2, xd_full2, n, .{ .c0 = h * half, .cols = half, .z = z, .compact = true });
+        for (rp[0..2]) |r| try P.combineRows(xk, s, svh_h + h * ne * half * 2, sc2, pick, wts, pmh + h * n * half * 4, n, half, ne, z, r.r0, r.rows);
+    }
+    for (0..2) |h| try P.combineRows(xk, s, svh_h + h * ne * half * 2, sc2, pick, wts, pmh + h * n * half * 4, n, half, ne, sc2.z + h * p * half * 4, rp[2].r0, rp[2].rows);
+    // half-major -> row-major (what gather's copies do across the nodes)
+    for (0..2) |h| try ops.copyRows(s, pmh + h * n * half * 4, half * 4, pm3 + h * half * 4, dn * 4, half * 4, n);
+    try s.synchronize();
+    const c_dn = try compare(d, a, pm2, pm3, n * dn * 4);
+    // launch cost on one GPU: v2's gate / up whole vs pack's two parts; v2's down + combine vs dnc's vs dn's
+    var t: [5][]f32 = undefined;
+    for (&t) |*x| x.* = try a.alloc(f32, iters);
+    for (0..iters + 1) |it| {
+        tm.n = 0;
+        try tm.mark(s);
+        try P.gateUp(k, xk, ops, s, ex, sc2, rs2, xin, dd, pick, n, limit);
+        try tm.mark(s);
+        if (rest_ok) {
+            try P.gateUpPart(k, xk, ops, s, ex, sc2, rs2, xin, dd, pick, n, limit, .main);
+            try P.gateUpPart(k, xk, ops, s, ex, sc2, rs2, xin, dd, pick, n, limit, .rest);
+        }
+        try tm.mark(s);
+        try P.down(k, xk, s, ex, sc2, xd_full2, pick, wts, pm3, n);
+        try tm.mark(s);
+        try P.downGemm(k, s, ex, sc2, xd_full2, n, .{ .c0 = 0, .cols = dn, .z = sc2.z, .compact = false });
+        for (rp) |r| try P.combineRows(xk, s, ex.svh_d, sc2, pick, wts, pm3, n, dn, ne, sc2.z, r.r0, r.rows);
+        try tm.mark(s);
+        for (0..2) |h| {
+            const z = sc2.z + h * p * half * 4;
+            try P.downGemm(k, s, ex, sc2, xd_full2, n, .{ .c0 = h * half, .cols = half, .z = z, .compact = true });
+            for (rp) |r| try P.combineRows(xk, s, svh_h + h * ne * half * 2, sc2, pick, wts, pmh + h * n * half * 4, n, half, ne, z, r.r0, r.rows);
+        }
+        try tm.mark(s);
+        try s.synchronize();
+        if (it > 0) for (0..5) |j| {
+            t[j][it - 1] = try tm.ms(j);
+        };
+    }
+    var m: [5]f32 = undefined;
+    for (0..5) |j| m[j] = median(t[j]);
+    // the rest block's share of gate / up (pack's hiding window) on its own
+    var tr = try a.alloc(f32, iters);
+    if (rest_ok) for (0..iters + 1) |it| {
+        try P.gateUpPart(k, xk, ops, s, ex, sc2, rs2, xin, dd, pick, n, limit, .main);
+        tm.n = 0;
+        try tm.mark(s);
+        try P.gateUpPart(k, xk, ops, s, ex, sc2, rs2, xin, dd, pick, n, limit, .rest);
+        try tm.mark(s);
+        try s.synchronize();
+        if (it > 0) tr[it - 1] = try tm.ms(0);
+    };
+    const m_rest = if (rest_ok) median(tr) else 0;
+    const equal = c_pack.diff == 0 and c_dnc.diff == 0 and c_dn.diff == 0;
+    const fnn: f32 = @floatFromInt(n);
+    try d.check(d.api.cuMemcpyDtoDAsync_v2(sc2.xd, save_xd, xd_bytes, s.handle), "cuMemcpyDtoDAsync");
+    try s.synchronize();
+    try out.interface.print("{{\"layer\": {d}, \"rows\": {d}, \"path\": \"xovl\", \"equal\": {}, \"diff_bytes\": {{\"pack_xd\": {d}, \"dnc_out\": {d}, \"dn_out\": {d}}}, \"ms\": {{\"gateup\": {d:.3}, \"gateup_pack\": {d:.3}, \"rest_part\": {d:.3}, \"down\": {d:.3}, \"down_dnc\": {d:.3}, \"down_dn\": {d:.3}}}, \"us_row\": {{\"pack_extra\": {d:.3}, \"rest_window\": {d:.3}, \"dnc_extra\": {d:.3}, \"dn_extra\": {d:.3}, \"down\": {d:.3}}}}}\n", .{ li, n, equal, c_pack.diff, c_dnc.diff, c_dn.diff, m[0], m[1], m_rest, m[2], m[3], m[4], (m[1] - m[0]) * 1000 / fnn, m_rest * 1000 / fnn, (m[3] - m[2]) * 1000 / fnn, (m[4] - m[2]) * 1000 / fnn, m[2] * 1000 / fnn });
+    try out.interface.flush();
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const io = init.io;
@@ -451,6 +549,22 @@ pub fn main(init: std.process.Init) !u8 {
         }
         xd_full2 = try alloc(d, &bufs, a, cap * sl * ifull * 2, 0);
         pm2 = try alloc(d, &bufs, a, cap * dn * 4, 0);
+    }
+    // TF_BENCH_XOVL=1 (with --v2 1; stage ZX1): TF_DS_PROMPT_OVL's expert-side launch plans on the same inputs, every
+    // byte against v2's whole launches: pack's split gate / up (gateUpPart .main then .rest), dnc's row-split combine,
+    // dn's column-half down GEMM (compact partials) and combine (svh_d halves, half-major out, put back row-major here)
+    const xovl = pk != null and std.c.getenv("TF_BENCH_XOVL") != null;
+    var ref_xd: u64 = 0;
+    var save_xd: u64 = 0;
+    var pm3: u64 = 0;
+    var pmh: u64 = 0;
+    var svh_h: u64 = 0;
+    if (xovl) {
+        ref_xd = try alloc(d, &bufs, a, cap * sl * (ig + ir) * 2, 0);
+        save_xd = try alloc(d, &bufs, a, cap * sl * (ig + ir) * 2, 0);
+        pm3 = try alloc(d, &bufs, a, cap * dn * 4, 0);
+        pmh = try alloc(d, &bufs, a, cap * dn * 4, 0);
+        svh_h = try alloc(d, &bufs, a, 2 * e_count * (dn / 2) * 2, 0);
     }
 
     var prng = std.Random.DefaultPrng.init(seed);
@@ -703,6 +817,7 @@ pub fn main(init: std.process.Init) !u8 {
                     med_new[j] = median(t_new[j]);
                     tot_new += med_new[j];
                 }
+                if (xovl) try xovlCheck(d, a, &out, s, &tm, k, &xk, &ops, ex, sc2, rs2, xin, dd, pick, wts, xd_full2, pm2, ref_xd, save_xd, pm3, pmh, svh_h, n, sl, ig, ir, dn, e_count, rank, iters, cfg.swiglu_limit, li);
                 try out.interface.print("{{\"layer\": {d}, \"rows\": {d}, \"path\": \"v2\", \"ms\": {{\"gateup+rest\": {d:.3}, \"assemble\": {d:.3}, \"down\": {d:.3}}}, \"total_ms\": {d:.3}, \"us_row\": {d:.3}, \"speedup\": {d:.3}, \"equal\": {}, \"diff_bytes\": {{\"z_gateup\": {d}, \"z_rest\": {d}, \"xd\": {d}, \"xd_full\": {d}, \"z_down\": {d}, \"out\": {d}}}, \"first\": {{\"z_gateup\": {?d}, \"z_down\": {?d}}}}}\n", .{ li, n, med_new[0], med_new[2], med_new[3], tot_new, tot_new * 1000 / @as(f32, @floatFromInt(n)), tot_old / tot_new, same, c_zg.diff, c_zr.diff, c_xd.diff, c_full.diff, c_zd.diff, c_pm.diff, c_zg.first, c_zd.first });
                 try out.interface.flush();
             }

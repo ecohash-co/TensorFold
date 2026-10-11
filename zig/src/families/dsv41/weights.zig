@@ -42,6 +42,9 @@ pub const Experts = struct {
     shared_up: [2]u64 = .{ 0, 0 }, // its up and down trellises the same way (the served "moe" fork reads all three)
     shared_down: [2]u64 = .{ 0, 0 },
     rest: ?Rest = null, // TF_DS_2D_GU=parity: the ninth gate / up block of the experts whose parity is this pair's
+    // TF_DS_PROMPT_OVL=dn (model.dnTables): svh_d's column halves, fp16 [2, E, down_n / 2] (half h of every expert's
+    // row at h E down_n / 2), copied once at load for the encoder layers; 0 elsewhere
+    svh_d_halves: u64 = 0,
 };
 
 /// experts2d.Rest2D: a parity split's rest columns (one 128-block of the rank's half, after both pairs' main blocks) of

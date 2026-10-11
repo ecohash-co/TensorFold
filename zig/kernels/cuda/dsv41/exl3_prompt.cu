@@ -12,7 +12,9 @@
 //     pinned by intrinsics), so the fp16 xg / xu rows (2 x 14,336 x 5,120 x 2 bytes at 2,048 rows) are never written or
 //     read, and suh comes two steps ahead in registers; the parity split's rest block is a launch of its own.
 //   - down: the rows are the assembled fp16 intermediate's, copied as they are.
-// Output: the same fp32 partials (Z) at the same places; the served epilogues and combine run after it unchanged. The
+// Output: the same fp32 partials (Z) at the same places; the served epilogues and combine run after it unchanged.
+// (TF_DS_PROMPT_OVL=dn: a launch may cover a range of column blocks (cb0) and put its columns in a compact Z part
+// (z_ld, z_c0); each element's operands and sums are the same, only where it lands moves.) The
 // work list is walked from its end (the shared expert, every row and the widest trellises, first). The register entries
 // (run / program: one step of words ahead in registers, 128 columns) cover K2 past the ring's and other widths.
 #include <cstddef>
@@ -200,6 +202,7 @@ struct Args {
     // xa [P, K] fp16
     const __nv_bfloat16* x;
     int x_stride;
+    int cb0;     // TF_DS_PROMPT_OVL=dn: the launch's first (128- or 256-column) block; 0: every block from the first
     const half* suh0;
     const half* suh1;
     const half* xa;
@@ -226,10 +229,15 @@ struct Args {
     int wk;      // chains a split
     int fold;    // 1: the splits' sums added in order from 0 (gate / up), 0: one split written as is (down)
     int k2_lo;   // a program runs only for a matrix of K2 in [k2_lo, the entry's HI] (one launch a K2 window)
+    // TF_DS_PROMPT_OVL=dn: the main Z as a compact column part [mats, P, z_ld] holding columns [z_c0, z_c0 + z_ld)
+    // (0: Z [mats, P, N], every column at its own place); only where the outputs land changes
+    int z_ld;
+    int z_c0;
 };
 // the layout exl3_prompt.zig's Args writes
-static_assert(sizeof(Args) == 192 && offsetof(Args, suh0) == 16 && offsetof(Args, maxm) == 136 && offsetof(Args, z) == 144 &&
-              offsetof(Args, fold) == 184 && offsetof(Args, k2_lo) == 188, "Args layout");
+static_assert(sizeof(Args) == 200 && offsetof(Args, cb0) == 12 && offsetof(Args, suh0) == 16 && offsetof(Args, maxm) == 136 &&
+              offsetof(Args, z) == 144 && offsetof(Args, fold) == 184 && offsetof(Args, k2_lo) == 188 &&
+              offsetof(Args, z_ld) == 192 && offsetof(Args, z_c0) == 196, "Args layout");
 
 template <int CB, int K2, bool ROT>
 __device__ __forceinline__ void run(const Args& g, const uint32_t* __restrict__ T, int NTILES, int nt0, int e,
@@ -405,7 +413,7 @@ __device__ __forceinline__ void program(const Args& g) {
     const int mb = g.work[2 * blockIdx.y + 1];
     const int mats = ROT ? 2 : 1;
     const int mat = (int)blockIdx.x % mats;
-    const int cb = (int)blockIdx.x / mats;
+    const int cb = g.cb0 + (int)blockIdx.x / mats;
     const int nmain = g.N / 128;
     const bool rest = cb >= nmain;
     const int e = g.uids[u];
@@ -415,8 +423,9 @@ __device__ __forceinline__ void program(const Args& g) {
     if (k2 < g.k2_lo || k2 > HI) return;                      // another launch's K2 window
     const int NTILES = (rest ? g.NR : g.N) >> 4;
     const int nt0 = (rest ? cb - nmain : cb) * 8;
-    const int N = rest ? g.NR : g.N;
-    float* Z = (rest ? g.zr : g.z) + (size_t)mat * g.P * N;
+    const int zld = (rest || g.z_ld == 0) ? (rest ? g.NR : g.N) : g.z_ld;   // Z's row stride
+    const int zc0 = (rest || g.z_ld == 0) ? 0 : g.z_c0;                   // Z's first column
+    float* Z = (rest ? g.zr : g.z) + (size_t)mat * g.P * zld;
 
     __shared__ int rows_sh[ROWS];
     __shared__ int xrow_sh[ROWS];
@@ -438,7 +447,7 @@ __device__ __forceinline__ void program(const Args& g) {
 #define TF_V2_CASE(K2_)                                                                                         \
     case K2_:                                                                                                   \
         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            run<CB, K2_, ROT>(g, T, NTILES, nt0, e, suh, Z, N, nt0 * 16, rows_sh, xrow_sh, nlive, As);          \
+            run<CB, K2_, ROT>(g, T, NTILES, nt0, e, suh, Z, zld, nt0 * 16 - zc0, rows_sh, xrow_sh, nlive, As);  \
         else                                                                                                    \
             __trap();                                                                                           \
         break;
@@ -647,7 +656,7 @@ __device__ __forceinline__ void program_ring(const Args& g) {
     const int mb = g.work[2 * y + 1];
     const int mats = ROT ? 2 : 1;
     const int mat = (int)blockIdx.x % mats;
-    const int cb = (int)blockIdx.x / mats;
+    const int cb = g.cb0 + (int)blockIdx.x / mats;
     const int nmain = g.N / (16 * NW);
     const bool rest = cb >= nmain;
     const int e = g.uids[u];
@@ -658,8 +667,9 @@ __device__ __forceinline__ void program_ring(const Args& g) {
     const int NTILES = (rest ? g.NR : g.N) >> 4;
     const int nt0 = (rest ? cb - nmain : cb) * NW;
     const int nact = min(NW, NTILES - nt0);                   // the warps with a column tile
-    const int N = rest ? g.NR : g.N;
-    float* Z = (rest ? g.zr : g.z) + (size_t)mat * g.P * N;
+    const int zld = (rest || g.z_ld == 0) ? (rest ? g.NR : g.N) : g.z_ld;   // Z's row stride
+    const int zc0 = (rest || g.z_ld == 0) ? 0 : g.z_c0;                   // Z's first column
+    float* Z = (rest ? g.zr : g.z) + (size_t)mat * g.P * zld;
     constexpr int TWM = 4 * HI;
 
     __shared__ int rows_sh[ROWS];
@@ -684,7 +694,7 @@ __device__ __forceinline__ void program_ring(const Args& g) {
 #define TF_V2_CASE(K2_)                                                                                         \
     case K2_:                                                                                                   \
         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            run_ring<CB, K2_, ROT, TWM, NW, MTP>(g, T, NTILES, nt0, e, suh, Z, N, nt0 * 16, rows_sh, xrow_sh, nlive, nact, As, Ws); \
+            run_ring<CB, K2_, ROT, TWM, NW, MTP>(g, T, NTILES, nt0, e, suh, Z, zld, nt0 * 16 - zc0, rows_sh, xrow_sh, nlive, nact, As, Ws); \
         else                                                                                                    \
             __trap();                                                                                           \
         break;

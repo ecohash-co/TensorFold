@@ -86,10 +86,33 @@ pub fn promptA2a() !bool {
 
 /// TF_DS_PROMPT_OVL (four-node split, with SP rows; ovl.zig): some of an SP chunk's exchanges on a comm stream beside
 /// the compute stream, under compute that does not read them yet: a comma list of engram (needs TF_DS_PROMPT_ENGRAM=sp),
-/// xag, wob, prio, or all. Unset / "" / "off": none, as served. Any other value refuses to start.
+/// xag, wob, prio, pack (needs TF_DS_EXL3_PROMPT=v2 and TF_DS_2D_GU=parity), dn or dnc (need v2), fxag, or all
+/// (engram, xag, wob). Unset / "" / "off": none, as served. Any other value refuses to start.
 pub fn promptOvl() !ovl.Levers {
     const v = std.c.getenv("TF_DS_PROMPT_OVL") orelse return .{};
     return ovl.parse(std.mem.span(v));
+}
+
+/// TF_DS_PROMPT_OVL=dn: each encoder layer's svh_d [E, dn] (down's output signs, which the served combine reads at row
+/// stride dn) copied once into its column halves [2, E, dn / 2] (held by the weights), so a half's combine reads the
+/// same values at stride dn / 2. Returns the bytes held.
+fn dnTables(d: *const cuda.Driver, w: *weights.Weights, o: *const ops_mod.Ops, s: cuda.Stream, layers: usize) !usize {
+    var total: usize = 0;
+    for (w.layers[0..@min(layers, w.layers.len)]) |*lay| {
+        const ex = &lay.experts;
+        const dn: usize = ex.down_n;
+        const half = ovl.dnHalf(dn) orelse return error.OvlDnShape;
+        const ne: usize = ex.count;
+        const bytes = 2 * ne * half * 2;
+        var b = try cuda.DeviceBuffer.alloc(d, bytes);
+        errdefer b.free();
+        for (0..2) |h| try o.copyRows(s, ex.svh_d + h * half * 2, dn * 2, b.ptr + h * ne * half * 2, half * 2, half * 2, ne);
+        try w.buffers.append(w.gpa, b);
+        ex.svh_d_halves = b.ptr;
+        total += bytes;
+    }
+    try s.synchronize();
+    return total;
 }
 
 /// TF_DS_PROMPT_OVERLAP=1 (four-node split, with TF_DS_PROMPT_CHUNK=4096): an encoder-only pass's two chunks run one
@@ -427,9 +450,17 @@ pub const Model = struct {
             if (ovl_lv.any()) {
                 // TF_DS_PROMPT_OVL: the engram lever splits engramSumSp (its plan), so it needs TF_DS_PROMPT_ENGRAM=sp
                 if (ovl_lv.engram and !m.two.?.engram_sp) return error.OvlEngramNeedsEngramSp;
+                // the expert side (stage ZX1) splits v2's launches: pack the parity split's pack, dn / dnc v2's down
+                if (ovl_lv.experts() and m.x2 == null) return error.OvlExpertsNeedV2;
+                if (ovl_lv.pack and m.two.?.ir == 0) return error.OvlPackNeedsParity;
+                if (ovl_lv.dn) for (m.two.?.dw) |w| if (ovl.dnHalf(w) == null) return error.OvlDnShape;
                 m.ovl_side = try ovl.Side.init(d, ovl_lv);
                 var nb: [64]u8 = undefined;
                 std.log.info("TF_DS_PROMPT_OVL={s}: exchanges on a comm stream beside compute ({s})", .{ ovl_lv.names(&nb), if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset" });
+                if (ovl_lv.dn) {
+                    const tb = try dnTables(d, &m.w, &m.ops, m.stream, c.layers / 2);
+                    std.log.info("TF_DS_PROMPT_OVL=dn: down's svh_d halves {d} KiB (layers 0-{d})", .{ tb >> 10, c.layers / 2 - 1 });
+                }
             }
             if (o.rdma_devices) |devs| {
                 const image: []const u8 = if (o.rdma_kernels) |path|

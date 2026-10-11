@@ -303,6 +303,11 @@ pub const Two = struct {
     /// toOwners' transfers (its NCCL part) on stream `s`: every other owner's rows of `src` to it, this node's rows of
     /// theirs into `parts`. This node's own rows of `src` are not read (TF_DS_PROMPT_OVL=wob computes them meanwhile).
     pub fn toOwnersSend(t: *const Two, e: *const prompt.Engine, s: cuda.Stream, src: u64, o: Owners, w: [2]usize, esize: usize) !void {
+        return t.toOwnersSendAt(e, s, src, t.parts, o, w, esize);
+    }
+
+    /// toOwnersSend with this node's rows of the others' parts landing at `parts` (t.parts, or a half's area of it).
+    fn toOwnersSendAt(t: *const Two, e: *const prompt.Engine, s: cuda.Stream, src: u64, parts: u64, o: Owners, w: [2]usize, esize: usize) !void {
         if (!o.valid()) return error.BadOwnerRows;
         const me = t.r + 2 * t.p;
         if (o.rows(3) * @max(w[0], w[1]) * esize > t.part_bytes) return error.PartTooBig;
@@ -315,7 +320,7 @@ pub const Two = struct {
                 const xs = ownerExchange(me, st.to, o, w, esize);
                 const xr = ownerExchange(me, st.from, o, w, esize);
                 const s1 = [1]Comm.P2p{.{ .ptr = src + xs.send_off, .count = xs.send_bytes, .peer = @intCast(st.to) }};
-                const r1 = [1]Comm.P2p{.{ .ptr = t.parts + xr.recv_off, .count = xr.recv_bytes, .peer = @intCast(st.from) }};
+                const r1 = [1]Comm.P2p{.{ .ptr = parts + xr.recv_off, .count = xr.recv_bytes, .peer = @intCast(st.from) }};
                 try e.comm.sendRecv(&s1, &r1, .u8, s);
             }
         } else {
@@ -326,7 +331,7 @@ pub const Two = struct {
                 if (h == me) continue;
                 const x = ownerExchange(me, h, o, w, esize);
                 sends[k] = .{ .ptr = src + x.send_off, .count = x.send_bytes, .peer = @intCast(h) };
-                recvs[k] = .{ .ptr = t.parts + x.recv_off, .count = x.recv_bytes, .peer = @intCast(h) };
+                recvs[k] = .{ .ptr = parts + x.recv_off, .count = x.recv_bytes, .peer = @intCast(h) };
                 k += 1;
             }
             try e.comm.sendRecv(&sends, &recvs, .u8, s);
@@ -340,6 +345,26 @@ pub const Two = struct {
             const base = if (cp.from == me) src else t.parts;
             try e.ops.copyRows(e.s, base + cp.src_off, cp.src_ld, dst + cp.dst_off, cp.dst_ld, cp.bytes, o.rows(me));
         }
+    }
+
+    /// TF_DS_PROMPT_OVL=dn: toOwners' transfers of half h (0, 1) of a half-major part `src` [2, n, w[p] / 2] (half h's
+    /// columns of every row at src + h n w[p] / 2 esize), on stream s: each half's exchange is toOwners' on a part of
+    /// half the width, its receives in that half's area of `parts` (dnPartsOff).
+    pub fn toOwnersSendHalf(t: *const Two, e: *const prompt.Engine, s: cuda.Stream, src: u64, o: Owners, w: [2]usize, esize: usize, h: usize) !void {
+        const wh = try halves(w);
+        if (dnPartsOff(o, w, esize, 2) > 4 * t.part_bytes) return error.PartTooBig;
+        return t.toOwnersSendAt(e, s, src + h * o.n * wh[t.p] * esize, t.parts + dnPartsOff(o, w, esize, h), o, wh, esize);
+    }
+
+    /// TF_DS_PROMPT_OVL=dn: toOwnersCopy's bytes from a half-major part (after both halves' transfers): dst [2, rows,
+    /// w0 + w1] exactly as toOwnersCopy fills it from the row-major part.
+    pub fn toOwnersCopyHalves(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, o: Owners, w: [2]usize, esize: usize) !void {
+        const me = t.r + 2 * t.p;
+        const wh = try halves(w);
+        for (0..2) |h| for (ownerCopiesHalf(me, o, w, esize, h)) |cp| {
+            const base = if (cp.from == me) src + h * o.n * wh[t.p] * esize else t.parts + dnPartsOff(o, w, esize, h);
+            try e.ops.copyRows(e.s, base + cp.src_off, cp.src_ld, dst + cp.dst_off, cp.dst_ld, cp.bytes, o.rows(me));
+        };
     }
 
     /// Comm2D.gather (TP2 inside a pair: the DSpark drafter's sublayer partials): `src` [n, width] -> `dst` [2, n, width],
@@ -392,6 +417,8 @@ pub const Two = struct {
             return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
         }
         if (e.x2) |x2| {
+            // TF_DS_PROMPT_OVL=pack (an SP chunk on v2's parity experts): the pack exchange in two parts (packOvl)
+            if (t.ir != 0) if (t.packSide(e, ch)) |sd| return t.packOvl(e, ch, lay, x2, sd);
             // TF_DS_EXL3_PROMPT=v2: gate / up with the rotation in the program (main and rest), the same pack bytes
             try exl3_prompt.gateUp(x2, e.ex, e.ops, e.s, lay.experts, ch.xs, if (t.ir != 0) t.rest_chunk.? else null, ch.x, c.hidden, ch.pick, n, c.swiglu_limit);
         } else {
@@ -404,16 +431,107 @@ pub const Two = struct {
             try prompt.pm(e, .moe);
             try t.assembleParity(e, lay.experts, ch.xs.xd, ch.pick, n * ch.xs.slots);
             defer prompt.pm(e, .moe) catch {};
-            if (e.x2) |x2| return exl3_prompt.down(x2, e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
+            if (e.x2) |x2| return t.downV2(e, ch, lay, x2);
             return exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
         }
         try prompt.pm(e, .moe);
         try t.catRank(e, ch.xs.xd, t.xd_full, n * ch.xs.slots, t.gu, 2);
         try prompt.pm(e, .comm);
         if (e.x2) |x2| {
-            try exl3_prompt.down(x2, e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
+            try t.downV2(e, ch, lay, x2);
         } else try exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
         try prompt.pm(e, .moe);
+    }
+
+    /// The comm stream when TF_DS_PROMPT_OVL=pack acts on this chunk: an SP chunk (Engine.side is set for those alone)
+    /// whose pack the column ring would not take (every prompt-size pack: over the ring's slot, so it is NCCL today;
+    /// the same test as Ring.gatherInto's TooLarge, the same on every node).
+    fn packSide(t: *const Two, e: *const prompt.Engine, ch: *const prompt.Chunk) ?*ovl.Side {
+        const sd = e.side orelse return null;
+        if (!sd.lv.pack or ch.sp == null) return null;
+        const bytes = ch.n * ch.xs.slots * (t.gu[t.p] + t.ir) * 2;
+        if (t.rings) |rs| if (bytes <= rs.col.s.max_bytes) return null;
+        return sd;
+    }
+
+    /// TF_DS_PROMPT_OVL=pack: gate / up's main columns and their epilogue (sc.xd's main rows final), the main rows to
+    /// the column partner on the comm stream while the rest block's gate / up and epilogue run here, then the rest rows
+    /// (packExchange's one send / recv as two: the same bytes from the same offsets into the same offsets of t.peer);
+    /// assemble waits for both. Then down as packOvl's caller would run it.
+    fn packOvl(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer, x2: *const exl3_prompt.Kernels, sd: *ovl.Side) !void {
+        const c = e.c;
+        const n = ch.n;
+        const rows = n * ch.xs.slots;
+        const ig = t.gu[t.p];
+        const g: u32 = @intCast(t.r + 2 * t.p);
+        const xd = ch.xs.xd;
+        try exl3_prompt.gateUpPart(x2, e.ex, e.ops, e.s, lay.experts, ch.xs, t.rest_chunk.?, ch.x, c.hidden, ch.pick, n, c.swiglu_limit, .main);
+        try prompt.pm(e, .moe);
+        try sd.fork(e.s);
+        try e.comm.exchange(xd, rows * ig, t.peer, rows * ig, .f16, g ^ 2, sd.stream);
+        try exl3_prompt.gateUpPart(x2, e.ex, e.ops, e.s, lay.experts, ch.xs, t.rest_chunk.?, ch.x, c.hidden, ch.pick, n, c.swiglu_limit, .rest);
+        try prompt.pm(e, .moe);
+        try sd.fork(e.s);
+        try e.comm.exchange(xd + rows * ig * 2, rows * t.ir, t.peer + rows * ig * 2, rows * t.ir, .f16, g ^ 2, sd.stream);
+        try sd.end(.pack);
+        try sd.join(e.s, .pack);
+        try prompt.pm(e, .comm);
+        const rest = lay.experts.rest orelse return error.NoRest;
+        const part0 = if (t.p == 0) xd else t.peer;
+        const part1 = if (t.p == 1) xd else t.peer;
+        try e.ops.assembleRest(e.s, part0, part1, ch.pick, rest.owner, t.xd_full, rows, ig, t.ir);
+        defer prompt.pm(e, .moe) catch {};
+        return t.downV2(e, ch, lay, x2);
+    }
+
+    /// v2's down and combine into ch.pm: today's two launches, or with TF_DS_PROMPT_OVL=dn / dnc on an SP chunk the
+    /// MoE partial's toOwners started on the comm stream from inside them (dnOvl; prompt.gather finishes it).
+    fn downV2(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer, x2: *const exl3_prompt.Kernels) !void {
+        if (e.side) |sd| if (sd.lv.dn or sd.lv.dnc) if (ch.sp) |sp| if (ovl.othersFirst(sp.owners(), sp.g)) |rp| return t.dnOvl(e, ch, lay, x2, sd, sp.owners(), rp);
+        return exl3_prompt.down(x2, e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, ch.n);
+    }
+
+    /// TF_DS_PROMPT_OVL=dn / dnc (the plan in ovl.zig). dnc: down's GEMM as today, the combine of the other owners' rows,
+    /// toOwners' transfers on the comm stream (they read no row of this node's), this node's rows' combine under them.
+    /// dn: the same per column half, half A's transfers under half B's GEMM and combine; the partial half-major
+    /// [2, n, dw / 2] (the halves' partials compact in sc.z, each half's svh_d table copied at load), so each half's
+    /// owner rows are contiguous for its exchange. Every partial and every combined element is today's (the same
+    /// program and combine arithmetic on the same operands); only launch extents and where results land change.
+    fn dnOvl(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer, x2: *const exl3_prompt.Kernels, sd: *ovl.Side, o: Owners, rp: [3]ovl.Range) !void {
+        const ex = lay.experts;
+        const n = ch.n;
+        const sc = ch.xs;
+        const dn: usize = ex.down_n;
+        const nE: usize = ex.count;
+        if (!sd.lv.dn) {
+            // dnc
+            try exl3_prompt.downGemm(x2, e.s, ex, sc, t.xd_full, n, .{ .c0 = 0, .cols = dn, .z = sc.z, .compact = false });
+            for (rp[0..2]) |r| try exl3_prompt.combineRows(e.ex, e.s, ex.svh_d, sc, ch.pick, ch.wts, ch.pm, n, dn, nE, sc.z, r.r0, r.rows);
+            try sd.fork(e.s);
+            try t.toOwnersSend(e, sd.stream, ch.pm, o, t.dw, 4);
+            try sd.end(.dn);
+            try exl3_prompt.combineRows(e.ex, e.s, ex.svh_d, sc, ch.pick, ch.wts, ch.pm, n, dn, nE, sc.z, rp[2].r0, rp[2].rows);
+            ch.pm_sent = .whole;
+            return;
+        }
+        const half = ovl.dnHalf(dn) orelse return error.OvlDnShape;
+        if (ex.svh_d_halves == 0) return error.OvlDnNoTables;
+        const p = n * sc.slots;
+        for (0..2) |h| {
+            const z = sc.z + h * p * half * 4;
+            const svh = ex.svh_d_halves + h * nE * half * 2;
+            const out = ch.pm + h * n * half * 4;
+            try exl3_prompt.downGemm(x2, e.s, ex, sc, t.xd_full, n, .{ .c0 = h * half, .cols = half, .z = z, .compact = true });
+            for (rp[0..2]) |r| try exl3_prompt.combineRows(e.ex, e.s, svh, sc, ch.pick, ch.wts, out, n, half, nE, z, r.r0, r.rows);
+            try sd.fork(e.s);
+            try t.toOwnersSendHalf(e, sd.stream, ch.pm, o, t.dw, 4, h);
+        }
+        try sd.end(.dn);
+        for (0..2) |h| {
+            const z = sc.z + h * p * half * 4;
+            try exl3_prompt.combineRows(e.ex, e.s, ex.svh_d_halves + h * nE * half * 2, sc, ch.pick, ch.wts, ch.pm + h * n * half * 4, n, half, nE, z, rp[2].r0, rp[2].rows);
+        }
+        ch.pm_sent = .halves;
     }
 
     /// Engram's projection summed over the TP2 ranks and cast, kv [n, ew0 + ew1] bf16 = bf16(g0 + g1) (model.py esum
@@ -564,6 +682,37 @@ pub fn ownerCopies(me: usize, o: Owners, w: [2]usize, esize: usize) [4]OwnerCopy
             .dst_ld = row,
             .bytes = w[ph] * esize,
         };
+    }
+    return out;
+}
+
+/// TF_DS_PROMPT_OVL=dn: each pair's half width (w[p] / 2; every width even).
+pub fn halves(w: [2]usize) ![2]usize {
+    if (w[0] % 2 != 0 or w[1] % 2 != 0) return error.OddPartWidth;
+    return .{ w[0] / 2, w[1] / 2 };
+}
+
+/// TF_DS_PROMPT_OVL=dn: where half h's receives start in `parts` (h = 2: the end of both): half 0's slots (toOwners'
+/// at half the width) then half 1's.
+pub fn dnPartsOff(o: Owners, w: [2]usize, esize: usize, h: usize) usize {
+    return h * 4 * o.rows(3) * @max(w[0] / 2, w[1] / 2) * esize;
+}
+
+/// TF_DS_PROMPT_OVL=dn: toOwners' copies of half h of half-major parts into dst [2, q, w0 + w1]: half h of node
+/// `from`'s columns (its own src's half h, or what it sent into half h's area of parts) into the columns ownerCopies
+/// puts them in: rank from % 2's partial, pair from / 2's columns, offset by h halves. Source offsets are ownerCopies'
+/// at the half width (relative to the half's src, or to dnPartsOff(h)).
+pub fn ownerCopiesHalf(me: usize, o: Owners, w: [2]usize, esize: usize, h: usize) [4]OwnerCopy {
+    const wh = [2]usize{ w[0] / 2, w[1] / 2 };
+    const q = o.rows(me);
+    const row = (w[0] + w[1]) * esize;
+    var out = ownerCopies(me, o, wh, esize);
+    for (&out) |*cp| {
+        const rh = cp.from % 2;
+        const ph = cp.from / 2;
+        cp.dst_off = rh * q * row + ph * w[0] * esize + h * wh[ph] * esize;
+        cp.dst_ld = row;
+        cp.bytes = wh[ph] * esize;
     }
     return out;
 }
@@ -805,6 +954,57 @@ test "toOwners: every owner's rows of quarters' [2, n, D], from the bytes the fo
             };
         }
     }
+}
+
+test "TF_DS_PROMPT_OVL=dn: toOwners of half-major parts puts every byte where toOwners of the row-major part does" {
+    // even pair widths (halves of whole elements), four quarters and rows2's uneven node 3
+    inline for (.{ Owners{ .q = 2, .n = 8 }, Owners{ .q = 2, .n = 11 }, Owners{ .q = 3, .n = 12 } }) |o| {
+        inline for (.{ [2]usize{ 6, 4 }, [2]usize{ 4, 4 } }) |w| {
+            const n: usize = o.n;
+            const es: usize = 4;
+            const dw: usize = w[0] + w[1];
+            const wh = comptime halves(w) catch unreachable;
+            const whmax = comptime @max(wh[0], wh[1]);
+            var partial: [2][n][dw]u32 = undefined;
+            for (0..2) |r| for (0..n) |i| for (0..dw) |j| {
+                partial[r][i][j] = @intCast(r * 1000000 + i * 1000 + j);
+            };
+            // node g's part half-major: half h of its columns of every row at h n wh[g/2]
+            var parts: [4][n * dw]u32 = undefined;
+            for (0..4) |g| for (0..2) |h| for (0..n) |i| for (0..wh[g / 2]) |j| {
+                parts[g][h * n * wh[g / 2] + i * wh[g / 2] + j] = partial[g % 2][i][(g / 2) * w[0] + h * wh[g / 2] + j];
+            };
+            for (0..4) |me| {
+                const rm = o.rows(me);
+                var staged: [2 * 4 * n * whmax]u32 = @splat(0);
+                const staged_b = std.mem.sliceAsBytes(&staged);
+                try std.testing.expect(dnPartsOff(o, w, es, 2) <= staged_b.len);
+                for (0..2) |h| for (0..4) |peer| {
+                    if (peer == me) continue;
+                    const sx = ownerExchange(peer, me, o, wh, es);
+                    const rx = ownerExchange(me, peer, o, wh, es);
+                    try std.testing.expectEqual(sx.send_bytes, rx.recv_bytes);
+                    const base = dnPartsOff(o, w, es, h);
+                    // inside half h's area
+                    try std.testing.expect(base + rx.recv_off + rx.recv_bytes <= dnPartsOff(o, w, es, h + 1));
+                    const src_b = std.mem.sliceAsBytes(&parts[peer])[h * n * wh[peer / 2] * es ..];
+                    @memcpy(staged_b[base + rx.recv_off ..][0..rx.recv_bytes], src_b[sx.send_off..][0..sx.send_bytes]);
+                };
+                var dst: [2 * n * dw]u32 = @splat(0xffffffff);
+                const dst_b = std.mem.sliceAsBytes(&dst);
+                for (0..2) |h| for (ownerCopiesHalf(me, o, w, es, h)) |cp| {
+                    const base = if (cp.from == me) std.mem.sliceAsBytes(&parts[me])[h * n * wh[me / 2] * es ..] else staged_b[dnPartsOff(o, w, es, h)..];
+                    for (0..rm) |i| @memcpy(dst_b[cp.dst_off + i * cp.dst_ld ..][0..cp.bytes], base[cp.src_off + i * cp.src_ld ..][0..cp.bytes]);
+                };
+                // every element of the owner's [2, rows, D]: today's toOwners result (the test above checks that is
+                // partial's rows)
+                for (0..2) |r| for (0..rm) |i| for (0..dw) |j| {
+                    try std.testing.expectEqual(partial[r][o.r0(me) + i][j], dst[(r * rm + i) * dw + j]);
+                };
+            }
+        }
+    }
+    try std.testing.expectError(error.OddPartWidth, halves(.{ 5, 4 }));
 }
 
 test "rows2's owners: whole 16-row tiles for nodes 0-2, node 3 the rest in n's %16 class; four quarters when n % 64 == 0" {

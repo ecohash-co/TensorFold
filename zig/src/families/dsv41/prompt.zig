@@ -170,6 +170,10 @@ fn overlap(sp: Span, start: usize, n: usize) ?[2]usize {
 /// 16 (n / 64) for nodes 0-2, node 3 the rest; n a multiple of 64 gives four quarters, n = 4 q, as TF_DS_PROMPT_SP=rows
 /// takes them). cut: the chunk reaches the replay (TF_DS_PROMPT_SP=rows2): at the decoder's first layer its rows from
 /// the replay on come back whole to every node (spCutRows) and the chunk goes on replicated, as today.
+/// Where Two.dnOvl left the MoE partial's toOwners (TF_DS_PROMPT_OVL=dn / dnc): not sent, sent from the row-major
+/// partial, or sent half by half from the half-major one.
+pub const PmSent = enum { none, whole, halves };
+
 pub const Sp = struct {
     g: usize,
     q: usize,
@@ -339,6 +343,12 @@ pub const Chunk = struct {
     xag_sent: bool = false,
     wob_sent: bool = false,
     engram_staged: ?usize = null,
+    // TF_DS_PROMPT_OVL=dn / dnc (Two.dnOvl -> gather): the MoE partial's toOwners transfers are on the comm stream;
+    // .halves: the partial is half-major [2, n, dw / 2] (dn), .whole: row-major as today (dnc)
+    pm_sent: PmSent = .none,
+    // TF_DS_PROMPT_OVL=fxag (spGatherFfn -> moe): the FFN x all-gather's first exchange (with the row partner) is on the
+    // comm stream; moe issues the second and the router's runs around it
+    fxag_sent: bool = false,
 
     /// Every buffer for `cap` rows from `a`, the compressed layers' for chunks ending by position `tokens`; the scratch
     /// the served build zeros (or fills with -1) is set the same.
@@ -742,6 +752,8 @@ pub fn begin(e: *const Engine, ch: *Chunk, ids: []const i64, start: usize, host_
     ch.xag_sent = false;
     ch.wob_sent = false;
     ch.engram_staged = null;
+    ch.pm_sent = .none;
+    ch.fxag_sent = false;
     for (host_pos[0..n], 0..) |*p, i| p.* = @intCast(start + i);
     try upload(e, ch.ids, ids.ptr, n * 8);
     ch.pos = ch.pos0;
@@ -1326,6 +1338,15 @@ pub fn gather(e: *const Engine, ch: *Chunk, src: u64, dst: u64) !void {
                 ch.wob_sent = false;
                 return t.toOwnersCopy(e, src, dst, sp.owners(), t.ow, 4);
             }
+            if (ch.pm_sent != .none and src == ch.pm) {
+                // TF_DS_PROMPT_OVL=dn / dnc: Two.dnOvl sent the transfers on the comm stream; wait, then the copies
+                // (from the half-major partial with dn: the same bytes into the same places)
+                try e.side.?.join(e.s, .dn);
+                const halves = ch.pm_sent == .halves;
+                ch.pm_sent = .none;
+                if (halves) return t.toOwnersCopyHalves(e, src, dst, sp.owners(), t.ow, 4);
+                return t.toOwnersCopy(e, src, dst, sp.owners(), t.ow, 4);
+            }
             return t.toOwners(e, src, dst, sp.owners(), t.ow, 4);
         }
         return t.quarters(e, src, dst, ch.n, t.ow, 4); // 2D: the same [2, n, D] from the four quarters
@@ -1342,6 +1363,17 @@ pub fn ffnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     const src = try tri_hc.hcPrePf(e.t, v.h, lay.hc_ffn[0], lay.hc_ffn[1], lay.hc_ffn[2], v.pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, v.x, v.pre_f, v.post, v.comb, ch.part, .{ .gathered = ch.ga, .world = e.world, .h_out = v.h_alt }, v.rows, c.hidden);
     swapStreams(ch, if (src == v.h_alt) ch.h_alt else src);
     try pm(e, .mix);
+    if (e.side) |sd| if (sd.lv.fxag) if (ch.sp) |sp| if (ovl.fxagFits(sp.owners(), ch.sub_rows)) {
+        // TF_DS_PROMPT_OVL=fxag: the all-gather's first step, this node's rows with the row partner, on the comm stream
+        const d = e.c.hidden;
+        const o = sp.owners();
+        const g: u32 = @intCast(sp.g);
+        try sd.fork(e.s);
+        try e.comm.exchange(ch.x + o.r0(sp.g) * d * 2, o.q * d, ch.x + o.r0(sp.g ^ 1) * d * 2, o.q * d, .bf16, g ^ 1, sd.stream);
+        try sd.end(.fxag);
+        ch.fxag_sent = true;
+        return;
+    };
     try spGatherX(e, ch);
 }
 
@@ -1359,6 +1391,33 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
         // a decode-sized chunk: the row-invariant gate (rowmm_gate's chunk sums) and its routing
         kc = try tri_norm.rowmmGate(e.t, ch.x, d, lay.gate_w, ch.gl, n, d, c.experts);
         try tri_norm.route(e.t, ch.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
+    } else if (ch.fxag_sent) {
+        // TF_DS_PROMPT_OVL=fxag: gate_w's conversion under the first exchange; then the pair's rows (this pair's 2,048-row
+        // run) converted and through the router under the second (the pair's rows to the column partner, the other
+        // pair's from it), then the other run: xwTRows' two calls, each on its own rows with its own M, in the other order
+        const sd = e.side orelse return error.NoCommStream;
+        const sp = ch.sp orelse return error.NoSpRows;
+        const o = sp.owners();
+        const pr = sp.g / 2;
+        const sub = ch.sub_rows;
+        const g: u32 = @intCast(sp.g);
+        ch.fxag_sent = false;
+        try e.ops.f16ToF32(e.s, lay.gate_w, ch.gate_f, c.experts * d);
+        try sd.join(e.s, .fxag);
+        try pm(e, .comm);
+        try sd.fork(e.s);
+        try e.comm.exchange(ch.x + pr * sub * d * 2, sub * d, ch.x + (1 - pr) * sub * d * 2, (o.n - sub) * d, .bf16, g ^ 2, sd.stream);
+        try sd.end(.fxag);
+        for ([_]usize{ pr, 1 - pr }, 0..) |run, j| {
+            if (j == 1) {
+                try pm(e, .router);
+                try sd.join(e.s, .fxag);
+                try pm(e, .comm);
+            }
+            try e.ops.toF32(e.s, ch.x + run * sub * d * 2, ch.xf + run * sub * d * 4, sub * d);
+            try e.blas.xwT(ch.xf + run * sub * d * 4, ch.gate_f, ch.logits + run * sub * c.experts * 4, sub, d, c.experts);
+        }
+        try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
     } else {
         try e.ops.toF32(e.s, ch.x, ch.xf, n * d);
         try e.ops.f16ToF32(e.s, lay.gate_w, ch.gate_f, c.experts * d);

@@ -815,6 +815,12 @@ pub const Model = struct {
 
     /// A stream's prompt is about to fill pool slot `slot`, its compressed rows in its extent from position `base`.
     /// Wait for the next chunk's Engram read-ahead, if one runs (before the prompt it reads changes or goes).
+    /// TF_DS_ENGRAM_SPLIT is on: the prefetch reader shares its reads with a column partner.
+    pub fn splitOn(m: *const Model) bool {
+        const p = m.epf orelse return false;
+        return p.pair != null;
+    }
+
     pub fn joinAhead(m: *Model) void {
         if (m.ahead) |th| th.join();
         m.ahead = null;

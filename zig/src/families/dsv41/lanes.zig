@@ -39,6 +39,35 @@ pub var logits_sha = false;
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
 pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9 };
 
+/// Whether a follower's frame of this kind ends the prompt's Engram read-ahead (joinAhead; the prompt's ids may change
+/// after it): every kind but a chunk and the frames rank 0 sends inside a fill (the prompt cache's saves and restores,
+/// the image rows). With TF_DS_ENGRAM_SPLIT (`split`) also not snap_drop: rank 0 sends one inside a fill when a save
+/// evicts a kept state (a long prompt), and rank 0 does not stop its reader there; a follower that did would restart its
+/// plan at the next chunk and wait for a part of it its partner (rank 0) had already sent (stage ZE4's hang). Unset: as
+/// served (snap_drop stops).
+pub fn stopsAhead(kind: Kind, split: bool) bool {
+    return switch (kind) {
+        .fill_chunk, .snap_save, .snap_restore, .fill_images => false,
+        .snap_drop => !split,
+        else => true,
+    };
+}
+
+test "a follower's frames that end the read-ahead: snap_drop only without the split" {
+    for ([_]bool{ false, true }) |sp| {
+        try std.testing.expect(!stopsAhead(.fill_chunk, sp));
+        try std.testing.expect(!stopsAhead(.snap_save, sp));
+        try std.testing.expect(!stopsAhead(.snap_restore, sp));
+        try std.testing.expect(!stopsAhead(.fill_images, sp));
+        try std.testing.expect(stopsAhead(.fill_begin, sp));
+        try std.testing.expect(stopsAhead(.verify, sp));
+        try std.testing.expect(stopsAhead(.pass, sp));
+        try std.testing.expect(stopsAhead(.done, sp));
+    }
+    try std.testing.expect(stopsAhead(.snap_drop, false));
+    try std.testing.expect(!stopsAhead(.snap_drop, true));
+}
+
 /// A frame being written.
 pub const Wire = struct {
     buf: std.ArrayList(u8) = .empty,
@@ -934,7 +963,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
         if (try r.int(u64) != step) return error.OutOfStep;
         step += 1;
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
-        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images) {
+        if (stopsAhead(kind, m.splitOn())) {
             m.joinAhead();
             m.fill_seq = &.{};
         }

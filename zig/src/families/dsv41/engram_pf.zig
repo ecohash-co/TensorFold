@@ -238,11 +238,18 @@ pub const Pair = struct {
     arrived: u64 = 0,
     err: ?anyerror = null, // the receiver's (the link went down)
     closing: bool = false,
+    // how long the reader waits for a partner's part before it reads those rows itself (the same bytes): a guard, so a
+    // part that will never come (the partners' plans diverged) costs this wait instead of a hang
+    wait_ns: u64 = default_wait_ms * std.time.ns_per_ms,
     // the reader's counts for the chunk it is on (the reader's alone), added to the fill's at its end
     own_rows: u64 = 0,
     peer_rows: u64 = 0,
     xchg_ns: u64 = 0,
+    fallbacks: u64 = 0,
 };
+
+/// The partner's part waited for at most this long (ms) before the reader reads the rows itself.
+pub const default_wait_ms = 2000;
 
 fn writeFd(fd: std.c.fd_t, bytes: []const u8) !void {
     var done: usize = 0;
@@ -335,6 +342,7 @@ pub const Stats = struct {
     peer_rows: u64 = 0,
     xchg_ns: u64 = 0,
     stale: u64 = 0,
+    fallbacks: u64 = 0, // partner parts not received in Pair.wait_ns: those rows read here instead
 };
 
 pub const Prefetch = struct {
@@ -586,6 +594,7 @@ pub const Prefetch = struct {
         if (theirs[1] <= theirs[0]) return;
         const want: Hdr = .{ .layer = @intCast(j), .start = start, .n = n, .lo = theirs[0], .cnt = theirs[1] - theirs[0], .k = k, .row_w = rw };
         const ids = p.flat[theirs[0] * k .. theirs[1] * k];
+        const deadline = now(p.io) + pr.wait_ns;
         p.mutex.lockUncancelable(p.io);
         const b = while (true) {
             var hit: ?*Msg = null;
@@ -602,7 +611,15 @@ pub const Prefetch = struct {
                 p.mutex.unlock(p.io);
                 return e;
             }
-            p.ready_cond.waitUncancelable(p.io, &p.mutex);
+            const t = now(p.io);
+            if (t >= deadline) {
+                // the part has not come: these rows read here, as unsplit (the same bytes); if it comes later it is
+                // never taken (stale)
+                p.mutex.unlock(p.io);
+                pr.fallbacks += 1;
+                return p.readRows(p.tabs[j], j, ids, out[theirs[0] * k * rw ..][0 .. ids.len * rw]);
+            }
+            p.ready_cond.waitTimeout(p.io, &p.mutex, .{ .duration = .{ .raw = .fromNanoseconds(@intCast(deadline - t)), .clock = .awake } }) catch {};
         };
         b.state = .pinned;
         p.mutex.unlock(p.io);
@@ -633,6 +650,7 @@ pub const Prefetch = struct {
                 x.own_rows = 0;
                 x.peer_rows = 0;
                 x.xchg_ns = 0;
+                x.fallbacks = 0;
             }
             const t0 = now(p.io);
             var failed: ?anyerror = null;
@@ -659,6 +677,7 @@ pub const Prefetch = struct {
                     p.st.own_rows += x.own_rows;
                     p.st.peer_rows += x.peer_rows;
                     p.st.xchg_ns += x.xchg_ns;
+                    p.st.fallbacks += x.fallbacks;
                 }
             }
             p.ready_cond.broadcast(p.io);
@@ -701,21 +720,7 @@ pub const Prefetch = struct {
         const rows: [2]usize = if (p.pair) |pr| pr.split.own(n, pr.first) else .{ 0, n };
         const f0 = rows[0] * k;
         const m = (rows[1] - rows[0]) * k;
-        const ids = p.flat[f0..][0..m];
-        const w = p.w[0 .. m * t.row_w];
-        const s = p.s[0 .. m * t.row_s];
-        if (m > 0) {
-            if (p.ram[j]) |ram| {
-                try p.gather(t, ids, w, null);
-                const sr = ram.rows();
-                for (0..m) |i| {
-                    const id: usize = @intCast(ids[i]);
-                    if (id >= t.rows) return error.RowOutOfRange;
-                    @memcpy(s[i * t.row_s ..][0..t.row_s], sr[id * t.row_s ..][0..t.row_s]);
-                }
-            } else try p.gather(t, ids, w, s);
-            engram.decodeRows(w, s, out[f0 * t.row_w ..][0 .. m * t.row_w], m, t.row_w, t.row_s, 8);
-        }
+        if (m > 0) try p.readRows(t, j, p.flat[f0..][0..m], out[f0 * t.row_w ..][0 .. m * t.row_w]);
         if (p.pair) |pr| {
             if (j == 0) {
                 pr.own_rows += rows[1] - rows[0];
@@ -723,6 +728,24 @@ pub const Prefetch = struct {
             }
             try p.exchange(pr, start, n, j, out);
         }
+    }
+
+    /// The rows of `ids` (one Engram layer j's) read and decoded into `out` ([ids.len, row_w]): the weight rows by
+    /// AIO, the scale rows from RAM with `scales` (else by AIO too), decodeRows. ids.len at most the scratch's.
+    fn readRows(p: *Prefetch, t: engram_io.Table, j: usize, ids: []const i64, out: []u16) !void {
+        const m = ids.len;
+        const w = p.w[0 .. m * t.row_w];
+        const s = p.s[0 .. m * t.row_s];
+        if (p.ram[j]) |ram| {
+            try p.gather(t, ids, w, null);
+            const sr = ram.rows();
+            for (0..m) |i| {
+                const id: usize = @intCast(ids[i]);
+                if (id >= t.rows) return error.RowOutOfRange;
+                @memcpy(s[i * t.row_s ..][0..t.row_s], sr[id * t.row_s ..][0..t.row_s]);
+            }
+        } else try p.gather(t, ids, w, s);
+        engram.decodeRows(w, s, out[0 .. m * t.row_w], m, t.row_w, t.row_s, 8);
     }
 
     /// prompt.aioGather on this reader's ring (batches of a quarter of its slots, all submitted, then waited for),
@@ -855,7 +878,7 @@ pub const Prefetch = struct {
         if (s.takes == 0 and s.chunks == 0) return;
         if (p.pair) |pr| {
             var nb: [16]u8 = undefined;
-            std.debug.print("{{\"engram_pf\": {{\"depth\": {d}, \"scales\": {s}, \"chunks\": {d}, \"rows\": {d}, \"read_ms\": {d:.1}, \"takes\": {d}, \"waits\": {d}, \"wait_ms\": {d:.1}, \"misses\": {d}, \"resets\": {d}, \"split\": \"{s}\", \"own_rows\": {d}, \"peer_rows\": {d}, \"xchg_ms\": {d:.1}, \"stale\": {d}}}}}\n", .{ p.set.depth, if (p.set.scales) "true" else "false", s.chunks, s.rows, ms(s.read_ns), s.takes, s.waits, ms(s.wait_ns), s.misses, s.resets, pr.split.names(&nb), s.own_rows, s.peer_rows, ms(s.xchg_ns), s.stale });
+            std.debug.print("{{\"engram_pf\": {{\"depth\": {d}, \"scales\": {s}, \"chunks\": {d}, \"rows\": {d}, \"read_ms\": {d:.1}, \"takes\": {d}, \"waits\": {d}, \"wait_ms\": {d:.1}, \"misses\": {d}, \"resets\": {d}, \"split\": \"{s}\", \"own_rows\": {d}, \"peer_rows\": {d}, \"xchg_ms\": {d:.1}, \"stale\": {d}, \"fallbacks\": {d}}}}}\n", .{ p.set.depth, if (p.set.scales) "true" else "false", s.chunks, s.rows, ms(s.read_ns), s.takes, s.waits, ms(s.wait_ns), s.misses, s.resets, pr.split.names(&nb), s.own_rows, s.peer_rows, ms(s.xchg_ns), s.stale, s.fallbacks });
             return;
         }
         std.debug.print("{{\"engram_pf\": {{\"depth\": {d}, \"scales\": {s}, \"chunks\": {d}, \"rows\": {d}, \"read_ms\": {d:.1}, \"takes\": {d}, \"waits\": {d}, \"wait_ms\": {d:.1}, \"misses\": {d}, \"resets\": {d}}}}}\n", .{ p.set.depth, if (p.set.scales) "true" else "false", s.chunks, s.rows, ms(s.read_ns), s.takes, s.waits, ms(s.wait_ns), s.misses, s.resets });
@@ -1255,5 +1278,160 @@ test "split rows equal the rows engramApply reads itself, for both column partne
         if (split.milli == 1) try std.testing.expectEqual(@as(u64, 0), got_b);
         if (split.milli != 1) try std.testing.expect(got_b > box_n + 2); // (the junk and the real parts)
         if (split.milli < 1000) try std.testing.expect(got_a > 0);
+    };
+}
+
+test "a follower's plan dropped inside a long prompt (stage ZE4's hang): its partner's parts already taken, the rows still exact" {
+    // ZE4's S100 hung on a 156,941-token prompt: rank 0 sent a snap_drop inside the fill (a save evicting a kept
+    // state); the followers stopped their readers there (rank 0 does not), restarted their plans at the last chunk and
+    // waited for rank 0's part of it, which rank 0 had sent (and they had taken) before. lanes.stopsAhead now keeps the
+    // followers' plans on snap_drop with the split; here the guard under it: one partner (b, the follower) drops its
+    // plan after its reader has read the whole prompt, the other (a, rank 0) does not; b's rows of the chunks after
+    // must still be exact, and come from its own reads after the wait instead of a hang.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const rows = 80;
+    var json_buf: [1024]u8 = undefined;
+    const tw = rows * 64;
+    const ts = rows * 2;
+    const json = try std.fmt.bufPrint(&json_buf, "{{\"layers.1.engram.embed.weight\":{{\"dtype\":\"F8_E4M3\",\"shape\":[{d},64],\"data_offsets\":[0,{d}]}},\"layers.1.engram.embed.scale\":{{\"dtype\":\"F8_E8M0\",\"shape\":[{d},2],\"data_offsets\":[{d},{d}]}},\"layers.14.engram.embed.weight\":{{\"dtype\":\"F8_E4M3\",\"shape\":[{d},64],\"data_offsets\":[{d},{d}]}},\"layers.14.engram.embed.scale\":{{\"dtype\":\"F8_E8M0\",\"shape\":[{d},2],\"data_offsets\":[{d},{d}]}}}}", .{ rows, tw, rows, tw, tw + ts, rows, tw + ts, 2 * tw + ts, rows, 2 * tw + ts, 2 * tw + 2 * ts });
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    var len8: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len8, json.len, .little);
+    try file.appendSlice(a, &len8);
+    try file.appendSlice(a, json);
+    for (0..2 * tw + 2 * ts) |i| try file.append(a, @intCast((i * 29 + 11) % 251));
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = file.items });
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer a.free(dir);
+    var tables = try engram_io.Tables.open(a, io, dir);
+    defer tables.close();
+    var why: @import("config.zig").Why = .{};
+    var c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
+    c.engram_vocab = 10;
+    c.engram_heads = 1;
+    c.engram_pad = 0;
+    const map = [_]i32{ 7, 1, 2, 3, 4, 5 };
+    const h = engram.Hasher.init(c, &map, .{ .{ 3, 5, 7, 9 }, .{ 11, 13, 15, 17 } });
+    const pool = try engram_io.Pool.init(a, io, 2);
+    defer pool.deinit(a);
+    // a long prompt: 37 chunks of passes of 32 rows (two 16-row chunks) up to the replay, then 16-row chunks
+    var prng = std.Random.DefaultPrng.init(31);
+    var seq: [1170]i32 = undefined;
+    for (&seq) |*x| x.* = prng.random().intRangeLessThan(i32, 0, 6);
+    const lo = 1;
+    const hi = 3;
+    const k = hi - lo;
+    const pass = 32;
+    const chunk = 16;
+    const replay = 1100;
+    var plan: std.ArrayList([2]usize) = .empty;
+    defer plan.deinit(a);
+    {
+        var start: usize = 0;
+        while (start < seq.len) {
+            const n = nextRows(pass, chunk, start, seq.len, replay);
+            try plan.append(a, .{ start, n });
+            start += n;
+        }
+    }
+    try std.testing.expect(plan.items.len >= 37);
+    var wants: std.ArrayList([]u16) = .empty;
+    defer {
+        for (wants.items) |x| a.free(x);
+        wants.deinit(a);
+    }
+    for (plan.items) |ch| for (0..2) |j| {
+        const t = tables.layers.get(if (j == 0) 1 else 14).?;
+        const n = ch[1];
+        const cols = h.cols();
+        const hh = try a.alloc(i64, n * h.layers * cols);
+        defer a.free(hh);
+        h.hashes(seq[0 .. ch[0] + n], ch[0], n, hh);
+        const flat = try a.alloc(i64, n * k);
+        defer a.free(flat);
+        for (0..n) |r| for (0..k) |q| {
+            flat[r * k + q] = hh[(r * h.layers + j) * cols + lo + q];
+        };
+        const w = try a.alloc(u8, n * k * t.row_w);
+        defer a.free(w);
+        const sc = try a.alloc(u8, n * k * t.row_s);
+        defer a.free(sc);
+        try pool.gather(t, flat, w, sc);
+        const out = try a.alloc(u16, n * k * t.row_w);
+        engram.decodeRows(w, sc, out, n * k, t.row_w, t.row_s, 8);
+        try wants.append(a, out);
+    };
+    const Drive = struct {
+        // the fill's chunks; `drop_before`: stop (the follower's snap_drop) before that chunk, once its reader has
+        // read the whole prompt (so the partner's parts of the chunks after were all taken already)
+        fn run(pf: *Prefetch, sq: []const i32, pl: []const [2]usize, ws: []const []u16, drop_before: ?usize, bad: *usize) void {
+            for (pl, 0..) |ch, i| {
+                if (drop_before != null and drop_before.? == i) {
+                    while (pf.stats().chunks < pl.len) std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake) catch {};
+                    pf.stop();
+                }
+                pf.begin(sq, ch[0], ch[1], replay);
+                for (0..2) |j| {
+                    const got = (pf.take(j, ch[0], ch[1]) catch {
+                        bad.* += 1;
+                        continue;
+                    }) orelse {
+                        bad.* += 1;
+                        continue;
+                    };
+                    if (!std.mem.eql(u16, ws[2 * i + j], got[0..ws[2 * i + j].len])) bad.* += 1;
+                }
+            }
+        }
+    };
+    const port0: u16 = 36000 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 300))) * 8;
+    for ([_][]const u8{ "1", "0.5" }, 0..) |share, it| for ([_][]const u8{ "prompt,scales", "prompt" }, 0..) |val, iv| {
+        const split = try parseSplit(share);
+        const set = try parse(val);
+        const pa = Prefetch.init(a, io, &c, h, &tables, lo, hi, pass, chunk, set, 64) catch |e| switch (e) {
+            error.AioUnavailable => return error.SkipZigTest,
+            else => return e,
+        };
+        defer pa.deinit();
+        const pb = try Prefetch.init(a, io, &c, h, &tables, lo, hi, pass, chunk, set, 64);
+        defer pb.deinit();
+        const Acc = struct {
+            fn run(p: u16, out: *?link.Link) void {
+                out.* = link.Link.listen(.{ 127, 0, 0, 1 }, p) catch null;
+            }
+        };
+        const port = port0 + @as(u16, @intCast(2 * it + iv));
+        var acc: ?link.Link = null;
+        const th = try std.Thread.spawn(.{}, Acc.run, .{ port, &acc });
+        const cl = link.Link.connect(io, .{ 127, 0, 0, 1 }, port, 10) catch |e| {
+            th.join();
+            return e;
+        };
+        th.join();
+        const la = acc orelse return error.TestLinkFailed;
+        try pa.usePair(la.fd, split, true);
+        try pb.usePair(cl.fd, split, false);
+        pa.pair.?.wait_ns = 300 * std.time.ns_per_ms;
+        pb.pair.?.wait_ns = 300 * std.time.ns_per_ms;
+        var bad_a: usize = 0;
+        var bad_b: usize = 0;
+        const last = plan.items.len - 1;
+        const ta = try std.Thread.spawn(.{}, Drive.run, .{ pa, &seq, plan.items, wants.items, @as(?usize, null), &bad_a });
+        Drive.run(pb, &seq, plan.items, wants.items, last, &bad_b);
+        ta.join();
+        try std.testing.expectEqual(@as(usize, 0), bad_a);
+        try std.testing.expectEqual(@as(usize, 0), bad_b);
+        // b read the last chunk's partner rows itself, after the wait (both layers): the parts it needed were taken
+        // before the drop and a's plan never re-sends them
+        const sb = pb.stats();
+        try std.testing.expectEqual(@as(u64, 2), sb.fallbacks);
+        try std.testing.expectEqual(@as(u64, 0), pa.stats().fallbacks);
+        pa.stop();
+        pb.stop();
     };
 }

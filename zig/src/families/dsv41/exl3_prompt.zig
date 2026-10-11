@@ -295,6 +295,65 @@ pub fn gateUpPart(k: *const Kernels, xk: *const X.Kernels, o: *const ops_mod.Ops
     }
 }
 
+/// TF_DS_PROMPT_OVL=pack3: gate / up's main columns by halves, half h's partials compact (Z [2 mats, P, ig / 2] at
+/// sc.z + h 2 P ig / 2 floats) and its epilogue (the served kernel on that Z, with ex.gu_halves' tables at half width)
+/// into sc.xd's half-major main rows [2, P, ig / 2]; h = 0 also issues the grouping (as .main). Each partial is the
+/// program's for that (slot row, column) and each epilogue element reads the same values in the same 128-column
+/// Hadamard block (a half is two whole blocks), so every byte is .all's, at its half-major place. The rest block
+/// (.rest) follows unchanged.
+pub fn gateUpHalf(k: *const Kernels, xk: *const X.Kernels, o: *const ops_mod.Ops, s: cuda.Stream, ex: weights.Experts, sc: X.Scratch, x: u64, x_stride: usize, pick: u64, r: usize, limit: f32, h: usize) !void {
+    _ = o;
+    const pl = try X2.Plan.of(ex);
+    const e: usize = ex.count;
+    const slots = sc.slots;
+    if (r < X.exact_rows or r > sc.rows) return error.NotAPromptChunk;
+    if (slots > 32 or pl.ig % 512 != 0 or h > 1) return error.UnsupportedShape;
+    if (ex.gu_halves == 0) return error.OvlPackNoTables;
+    const half = pl.ig / 2;
+    const p = r * slots;
+    const maxu = @min(p, e);
+    const maxm = X.memberStride(r);
+    const ch = try chains(pl.d, pl.cgu);
+    if (h == 0) {
+        const n_gu = X.listLen(p, maxu, X.mma_rows_gu);
+        const n_d = X.listLen(p, maxu, X.rows_rows_d);
+        var a: cuda.Args = .{};
+        a.add(pick);
+        a.add(sc.counts);
+        i32a(&a, p);
+        try launch(xk.group_count, s, .{ e, 1, 1 }, X.place_threads, &a);
+        a = .{};
+        for ([_]u64{ pick, sc.counts, sc.ids, sc.count, sc.members }) |v| a.add(v);
+        for ([_]usize{ p, slots, e, maxm }) |v| i32a(&a, v);
+        try launch(xk.group_place, s, .{ e, 1, 1 }, X.place_threads, &a);
+        a = .{};
+        for ([_]u64{ sc.counts, sc.ids, sc.count }) |v| a.add(v);
+        i32a(&a, maxu);
+        a.add(sc.work_gu);
+        i32a(&a, X.mma_rows_gu);
+        i32a(&a, n_gu);
+        a.add(sc.work_d);
+        i32a(&a, X.rows_rows_d);
+        i32a(&a, n_d);
+        a.add(@as(c_int, -1));
+        try launch(xk.work_list, s, .{ 1, 1, 1 }, X.list_threads, &a);
+    }
+    const z = sc.z + h * 2 * p * half * 4;
+    var g: Args = .{ .x = x, .x_stride = @intCast(x_stride), .suh0 = ex.suh_g, .suh1 = ex.suh_u, .tp0 = ex.gate_ptr, .tp1 = ex.up_ptr, .k2_0 = ex.gate_k2, .k2_1 = ex.up_k2, .uids = sc.ids, .ucount = sc.count, .members = sc.members, .work = if (k.rows == X.mma_rows_gu) sc.work_gu else sc.work_d, .maxm = @intCast(maxm), .slots = @intCast(slots), .z = z, .K = @intCast(pl.d), .N = @intCast(pl.ig), .P = @intCast(p), .chain = @intCast(ch[0]), .wk = @intCast(ch[1]), .fold = 1 };
+    g.z_ld = @intCast(half);
+    g.z_c0 = @intCast(h * half);
+    const nw = X.listLen(p, maxu, k.rows);
+    if (nw > 0) try launchPart(k, s, g, ex.k2_gu[0], ex.k2_gu[1], half, true, nw, h * half);
+    const tb = ex.gu_halves;
+    const t_sz = e * half * 2; // bytes of one table's half
+    var a: cuda.Args = .{};
+    for ([_]u64{ z, pick, tb + (0 + h) * t_sz, tb + (2 + h) * t_sz, tb + (4 + h) * t_sz, sc.xd + h * p * half * 2 }) |v| a.add(v);
+    for ([_]usize{ p, half, 1, e }) |v| i32a(&a, v);
+    a.add(limit);
+    a.add(@as(c_int, X.act_f32));
+    try launch(xk.gateup_epilogue, s, .{ p, half / 128, 1 }, 32, &a);
+}
+
 /// gate / up's epilogue on the main columns: sc.xd [P, ig].
 fn mainEpilogue(xk: *const X.Kernels, s: cuda.Stream, ex: weights.Experts, sc: X.Scratch, pick: u64, p: usize, ig: usize, limit: f32) !void {
     var a: cuda.Args = .{};

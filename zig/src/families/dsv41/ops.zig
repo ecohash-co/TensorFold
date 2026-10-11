@@ -44,6 +44,7 @@ pub const Ops = struct {
     rest_group: cuda.Function,
     remap_picks: cuda.Function,
     assemble_rest: cuda.Function,
+    assemble_rest_h: cuda.Function, // TF_DS_PROMPT_OVL=pack3
 
     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
@@ -78,6 +79,7 @@ pub const Ops = struct {
             .rest_group = try fm.function("tf_ds_rest_group_kernel"),
             .remap_picks = try fm.function("tf_ds_remap_picks_kernel"),
             .assemble_rest = try fm.function("tf_ds_assemble_rest_kernel"),
+            .assemble_rest_h = try fm.function("tf_ds_assemble_rest_h_kernel"),
         };
     }
 
@@ -333,6 +335,17 @@ pub const Ops = struct {
         for ([_]u64{ part0, part1, pick, owner, out }) |v| a.add(v);
         for ([_]usize{ p, ig / 8, ir / 8 }) |v| a.add(@as(c_int, @intCast(v)));
         try go(o.assemble_rest, s, @intCast(p), 64, &a);
+    }
+
+    /// TF_DS_PROMPT_OVL=pack3: assembleRest's bytes from packs whose main rows are half-major ([2, P, ig / 2], then the
+    /// rest rows [P, ir] as before).
+    pub fn assembleRestHalves(o: *const Ops, s: cuda.Stream, part0: u64, part1: u64, pick: u64, owner: u64, out: u64, p: usize, ig: usize, ir: usize) !void {
+        if (p == 0) return;
+        if (ig % 16 != 0 or ir % 8 != 0) return error.UnsupportedShape;
+        var a: cuda.Args = .{};
+        for ([_]u64{ part0, part1, pick, owner, out }) |v| a.add(v);
+        for ([_]usize{ p, ig / 8, ir / 8 }) |v| a.add(@as(c_int, @intCast(v)));
+        try go(o.assemble_rest_h, s, @intCast(p), 64, &a);
     }
 
     /// The GPU clock (ns) into buf[i] when the stream reaches it (a profile).

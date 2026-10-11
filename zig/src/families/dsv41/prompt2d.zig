@@ -448,13 +448,14 @@ pub const Two = struct {
     /// the same test as Ring.gatherInto's TooLarge, the same on every node).
     fn packSide(t: *const Two, e: *const prompt.Engine, ch: *const prompt.Chunk) ?*ovl.Side {
         const sd = e.side orelse return null;
-        if (!sd.lv.pack or ch.sp == null) return null;
+        if (!(sd.lv.pack or sd.lv.pack3) or ch.sp == null) return null;
         const bytes = ch.n * ch.xs.slots * (t.gu[t.p] + t.ir) * 2;
         if (t.rings) |rs| if (bytes <= rs.col.s.max_bytes) return null;
         return sd;
     }
 
-    /// TF_DS_PROMPT_OVL=pack: gate / up's main columns and their epilogue (sc.xd's main rows final), the main rows to
+    /// TF_DS_PROMPT_OVL=pack (pack3: the main columns and their rows by halves, ovl.zig): gate / up's main columns and
+    /// their epilogue (sc.xd's main rows final), the main rows to
     /// the column partner on the comm stream while the rest block's gate / up and epilogue run here, then the rest rows
     /// (packExchange's one send / recv as two: the same bytes from the same offsets into the same offsets of t.peer);
     /// assemble waits for both. Then down as packOvl's caller would run it.
@@ -465,10 +466,21 @@ pub const Two = struct {
         const ig = t.gu[t.p];
         const g: u32 = @intCast(t.r + 2 * t.p);
         const xd = ch.xs.xd;
-        try exl3_prompt.gateUpPart(x2, e.ex, e.ops, e.s, lay.experts, ch.xs, t.rest_chunk.?, ch.x, c.hidden, ch.pick, n, c.swiglu_limit, .main);
-        try prompt.pm(e, .moe);
-        try sd.fork(e.s);
-        try e.comm.exchange(xd, rows * ig, t.peer, rows * ig, .f16, g ^ 2, sd.stream);
+        if (sd.lv.pack3) {
+            // pack3: the main columns by halves, each half's rows (half-major) sent once its epilogue is done
+            const half = ovl.packHalf(ig) orelse return error.OvlPackShape;
+            for (0..2) |h| {
+                try exl3_prompt.gateUpHalf(x2, e.ex, e.ops, e.s, lay.experts, ch.xs, ch.x, c.hidden, ch.pick, n, c.swiglu_limit, h);
+                try prompt.pm(e, .moe);
+                try sd.fork(e.s);
+                try e.comm.exchange(xd + h * rows * half * 2, rows * half, t.peer + h * rows * half * 2, rows * half, .f16, g ^ 2, sd.stream);
+            }
+        } else {
+            try exl3_prompt.gateUpPart(x2, e.ex, e.ops, e.s, lay.experts, ch.xs, t.rest_chunk.?, ch.x, c.hidden, ch.pick, n, c.swiglu_limit, .main);
+            try prompt.pm(e, .moe);
+            try sd.fork(e.s);
+            try e.comm.exchange(xd, rows * ig, t.peer, rows * ig, .f16, g ^ 2, sd.stream);
+        }
         try exl3_prompt.gateUpPart(x2, e.ex, e.ops, e.s, lay.experts, ch.xs, t.rest_chunk.?, ch.x, c.hidden, ch.pick, n, c.swiglu_limit, .rest);
         try prompt.pm(e, .moe);
         try sd.fork(e.s);
@@ -479,7 +491,9 @@ pub const Two = struct {
         const rest = lay.experts.rest orelse return error.NoRest;
         const part0 = if (t.p == 0) xd else t.peer;
         const part1 = if (t.p == 1) xd else t.peer;
-        try e.ops.assembleRest(e.s, part0, part1, ch.pick, rest.owner, t.xd_full, rows, ig, t.ir);
+        if (sd.lv.pack3) {
+            try e.ops.assembleRestHalves(e.s, part0, part1, ch.pick, rest.owner, t.xd_full, rows, ig, t.ir);
+        } else try e.ops.assembleRest(e.s, part0, part1, ch.pick, rest.owner, t.xd_full, rows, ig, t.ir);
         defer prompt.pm(e, .moe) catch {};
         return t.downV2(e, ch, lay, x2);
     }

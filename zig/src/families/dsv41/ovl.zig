@@ -16,6 +16,10 @@
 //!   pack    the expert pack exchange with the column partner in two parts at the pack's seam: gate / up's main
 //!           columns and their epilogue first, the main rows on the comm stream under the rest block's gate / up and
 //!           its epilogue, then the rest rows; assemble waits (needs TF_DS_2D_GU=parity)
+//!   pack3   (instead of pack) the pack in three parts: gate / up's main columns by halves, each half's rows sent as
+//!           soon as its epilogue is done (half A under half B's gate / up, half B under the rest block's), then the
+//!           rest rows; the main rows half-major [2, P, ig / 2] (their epilogue tables copied by halves at load),
+//!           assembled into today's intermediate
 //!   dn      down and its combine in two column halves: half A's GEMM, combine of the other owners' rows, half A's
 //!           toOwners on the comm stream under half B's GEMM and combine, half B's toOwners, then both halves' combine of
 //!           this node's own rows under it; the MoE partial lands half-major [2, n, dn / 2] and gather's copies put
@@ -43,23 +47,24 @@ pub const Levers = struct {
     wob: bool = false,
     prio: bool = false,
     pack: bool = false,
+    pack3: bool = false,
     dn: bool = false,
     dnc: bool = false,
     fxag: bool = false,
 
     pub fn any(l: Levers) bool {
-        return l.engram or l.xag or l.wob or l.pack or l.dn or l.dnc or l.fxag;
+        return l.engram or l.xag or l.wob or l.pack or l.pack3 or l.dn or l.dnc or l.fxag;
     }
 
     /// Any expert-side lever (they need TF_DS_EXL3_PROMPT=v2's down and gate / up).
     pub fn experts(l: Levers) bool {
-        return l.pack or l.dn or l.dnc;
+        return l.pack or l.pack3 or l.dn or l.dnc;
     }
 
     /// The names of the active levers, as the start line prints them.
     pub fn names(l: Levers, buf: []u8) []const u8 {
         var n: usize = 0;
-        inline for (.{ "engram", "xag", "wob", "prio", "pack", "dn", "dnc", "fxag" }) |f| if (@field(l, f)) {
+        inline for (.{ "engram", "xag", "wob", "prio", "pack", "pack3", "dn", "dnc", "fxag" }) |f| if (@field(l, f)) {
             if (n > 0 and n < buf.len) {
                 buf[n] = ',';
                 n += 1;
@@ -73,15 +78,15 @@ pub const Levers = struct {
 };
 
 /// TF_DS_PROMPT_OVL's value: unset, "" or "off": none (today's launches); else a comma list of engram, xag, wob, prio,
-/// pack, dn, dnc, fxag, or "all" (engram, xag, wob); "prio" alone (no lever) is refused, as is any other word, and "dn" with
-/// "dnc" (dn's halves already combine the own rows last).
+/// pack, pack3, dn, dnc, fxag, or "all" (engram, xag, wob); "prio" alone (no lever) is refused, as is any other word,
+/// "dn" with "dnc" (dn's halves already combine the own rows last) and "pack" with "pack3".
 pub fn parse(v: ?[]const u8) !Levers {
     const s = v orelse return .{};
     if (s.len == 0 or std.mem.eql(u8, s, "off")) return .{};
     var l: Levers = .{};
     var it = std.mem.splitScalar(u8, s, ',');
     while (it.next()) |w| {
-        if (std.mem.eql(u8, w, "engram")) l.engram = true else if (std.mem.eql(u8, w, "xag")) l.xag = true else if (std.mem.eql(u8, w, "wob")) l.wob = true else if (std.mem.eql(u8, w, "prio")) l.prio = true else if (std.mem.eql(u8, w, "pack")) l.pack = true else if (std.mem.eql(u8, w, "dn")) l.dn = true else if (std.mem.eql(u8, w, "dnc")) l.dnc = true else if (std.mem.eql(u8, w, "fxag")) l.fxag = true else if (std.mem.eql(u8, w, "all")) {
+        if (std.mem.eql(u8, w, "engram")) l.engram = true else if (std.mem.eql(u8, w, "xag")) l.xag = true else if (std.mem.eql(u8, w, "wob")) l.wob = true else if (std.mem.eql(u8, w, "prio")) l.prio = true else if (std.mem.eql(u8, w, "pack")) l.pack = true else if (std.mem.eql(u8, w, "pack3")) l.pack3 = true else if (std.mem.eql(u8, w, "dn")) l.dn = true else if (std.mem.eql(u8, w, "dnc")) l.dnc = true else if (std.mem.eql(u8, w, "fxag")) l.fxag = true else if (std.mem.eql(u8, w, "all")) {
             l.engram = true;
             l.xag = true;
             l.wob = true;
@@ -89,6 +94,7 @@ pub fn parse(v: ?[]const u8) !Levers {
     }
     if (!l.any()) return error.BadPromptOvl;
     if (l.dn and l.dnc) return error.BadPromptOvl;
+    if (l.pack and l.pack3) return error.BadPromptOvl;
     return l;
 }
 
@@ -138,6 +144,13 @@ pub fn othersFirst(o: Owners, me: usize) ?[3]Range {
 pub fn dnHalf(dn: usize) ?usize {
     if (dn % 512 != 0) return null;
     return dn / 2;
+}
+
+/// TF_DS_PROMPT_OVL=pack3: the main columns' half width (gate / up's ig a pair), or null when the halves would not be
+/// whole 256-column programs.
+pub fn packHalf(ig: usize) ?usize {
+    if (ig % 512 != 0) return null;
+    return ig / 2;
 }
 
 /// TF_DS_PROMPT_OVL=fxag: whether a chunk's FFN x all-gather splits into the row-partner and column-partner exchanges
@@ -239,6 +252,11 @@ test "TF_DS_PROMPT_OVL: the expert-side words (not in all), dn with dnc refused"
     try std.testing.expectEqualStrings("engram,xag,wob,prio,pack,dn", (try parse("all,prio,pack,dn")).names(&buf));
     try std.testing.expectEqualStrings("dnc", (try parse("dnc")).names(&buf));
     try std.testing.expectEqual(Levers{ .fxag = true }, try parse("fxag"));
+    try std.testing.expectEqual(Levers{ .pack3 = true }, try parse("pack3"));
+    try std.testing.expect((try parse("pack3")).experts());
+    try std.testing.expectError(error.BadPromptOvl, parse("pack,pack3"));
+    try std.testing.expectEqual(@as(?usize, 256), packHalf(512));
+    try std.testing.expectEqual(@as(?usize, null), packHalf(640));
     try std.testing.expect(!(try parse("fxag")).experts());
 }
 

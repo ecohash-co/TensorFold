@@ -561,3 +561,21 @@ extern "C" __global__ void tf_ds_assemble_rest_kernel(const uint4* part0, const 
     }
     for (int c = threadIdx.x; c < ir8; c += blockDim.x) o[2 * ig8 + c] = rest[c];
 }
+
+// TF_DS_PROMPT_OVL=pack3: tf_ds_assemble_rest_kernel's bytes from packs whose main rows are half-major (columns
+// [h Ig / 2, (h + 1) Ig / 2) of every slot row at h P Ig / 2; the rest rows after both halves as before).
+extern "C" __global__ void tf_ds_assemble_rest_h_kernel(const uint4* part0, const uint4* part1, const int* pick,
+                                                        const int* owner, uint4* out, int P, int ig8, int ir8) {
+    const int row = blockIdx.x;
+    if (row >= P) return;
+    const int i8 = 2 * ig8 + ir8;
+    const int h8 = ig8 / 2;
+    const uint4* rest = (owner[pick[row]] == 0 ? part0 : part1) + (size_t)P * ig8 + (size_t)row * ir8;
+    uint4* o = out + (size_t)row * i8;
+    for (int c = threadIdx.x; c < ig8; c += blockDim.x) {
+        const size_t at = (size_t)(c / h8) * P * h8 + (size_t)row * h8 + (c % h8);
+        o[c] = part0[at];
+        o[ig8 + c] = part1[at];
+    }
+    for (int c = threadIdx.x; c < ir8; c += blockDim.x) o[2 * ig8 + c] = rest[c];
+}

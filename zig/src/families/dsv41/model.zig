@@ -93,6 +93,30 @@ pub fn promptOvl() !ovl.Levers {
     return ovl.parse(std.mem.span(v));
 }
 
+/// TF_DS_PROMPT_OVL=pack3: each encoder layer's gate / up epilogue tables (svh_g, svh_u, suh_d [E, width], read at
+/// row stride width) copied once into column halves [3, 2, E, width / 2], so a half's epilogue reads the same values at
+/// stride width / 2. Returns the bytes held.
+fn packTables(d: *const cuda.Driver, w: *weights.Weights, o: *const ops_mod.Ops, s: cuda.Stream, layers: usize) !usize {
+    var total: usize = 0;
+    for (w.layers[0..@min(layers, w.layers.len)]) |*lay| {
+        const ex = &lay.experts;
+        const ig: usize = ex.width;
+        const half = ovl.packHalf(ig) orelse return error.OvlPackShape;
+        const ne: usize = ex.count;
+        const bytes = 6 * ne * half * 2;
+        var b = try cuda.DeviceBuffer.alloc(d, bytes);
+        errdefer b.free();
+        for ([_]u64{ ex.svh_g, ex.svh_u, ex.suh_d }, 0..) |src, t| for (0..2) |h| {
+            try o.copyRows(s, src + h * half * 2, ig * 2, b.ptr + (2 * t + h) * ne * half * 2, half * 2, half * 2, ne);
+        };
+        try w.buffers.append(w.gpa, b);
+        ex.gu_halves = b.ptr;
+        total += bytes;
+    }
+    try s.synchronize();
+    return total;
+}
+
 /// TF_DS_PROMPT_OVL=dn: each encoder layer's svh_d [E, dn] (down's output signs, which the served combine reads at row
 /// stride dn) copied once into its column halves [2, E, dn / 2] (held by the weights), so a half's combine reads the
 /// same values at stride dn / 2. Returns the bytes held.
@@ -452,11 +476,16 @@ pub const Model = struct {
                 if (ovl_lv.engram and !m.two.?.engram_sp) return error.OvlEngramNeedsEngramSp;
                 // the expert side (stage ZX1) splits v2's launches: pack the parity split's pack, dn / dnc v2's down
                 if (ovl_lv.experts() and m.x2 == null) return error.OvlExpertsNeedV2;
-                if (ovl_lv.pack and m.two.?.ir == 0) return error.OvlPackNeedsParity;
+                if ((ovl_lv.pack or ovl_lv.pack3) and m.two.?.ir == 0) return error.OvlPackNeedsParity;
+                if (ovl_lv.pack3) for (m.two.?.gu) |w| if (ovl.packHalf(w) == null) return error.OvlPackShape;
                 if (ovl_lv.dn) for (m.two.?.dw) |w| if (ovl.dnHalf(w) == null) return error.OvlDnShape;
                 m.ovl_side = try ovl.Side.init(d, ovl_lv);
                 var nb: [64]u8 = undefined;
                 std.log.info("TF_DS_PROMPT_OVL={s}: exchanges on a comm stream beside compute ({s})", .{ ovl_lv.names(&nb), if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset" });
+                if (ovl_lv.pack3) {
+                    const tb = try packTables(d, &m.w, &m.ops, m.stream, c.layers / 2);
+                    std.log.info("TF_DS_PROMPT_OVL=pack3: gate / up epilogue tables by halves {d} KiB (layers 0-{d})", .{ tb >> 10, c.layers / 2 - 1 });
+                }
                 if (ovl_lv.dn) {
                     const tb = try dnTables(d, &m.w, &m.ops, m.stream, c.layers / 2);
                     std.log.info("TF_DS_PROMPT_OVL=dn: down's svh_d halves {d} KiB (layers 0-{d})", .{ tb >> 10, c.layers / 2 - 1 });

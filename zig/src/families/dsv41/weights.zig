@@ -45,6 +45,9 @@ pub const Experts = struct {
     // TF_DS_PROMPT_OVL=dn (model.dnTables): svh_d's column halves, fp16 [2, E, down_n / 2] (half h of every expert's
     // row at h E down_n / 2), copied once at load for the encoder layers; 0 elsewhere
     svh_d_halves: u64 = 0,
+    // TF_DS_PROMPT_OVL=pack3 (model.packTables): svh_g, svh_u and suh_d [E, width] in column halves, fp16 [3, 2, E,
+    // width / 2] (table t's half h at (2 t + h) E width / 2), copied once at load for the encoder layers; 0 elsewhere
+    gu_halves: u64 = 0,
 };
 
 /// experts2d.Rest2D: a parity split's rest columns (one 128-block of the rank's half, after both pairs' main blocks) of

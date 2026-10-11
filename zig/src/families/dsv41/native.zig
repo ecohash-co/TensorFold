@@ -38,6 +38,9 @@
 //!                                               (pprof.zig; one synchronize a chunk)
 //!   TF_DS_PROMPT_OVERLAP=1                      world 4 with TF_DS_PROMPT_CHUNK=4096: a pass's two chunks one layer
 //!                                               apart on two streams and NCCL communicators (model.Overlap)
+//!   TF_DS_PROMPT_OVL=engram,xag,wob[,prio]|all  with SP rows: an SP chunk's exchanges on a comm stream under compute
+//!                                               that does not read them yet, one NCCL communicator in one launch
+//!                                               order (ovl.zig; engram needs TF_DS_PROMPT_ENGRAM=sp)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the

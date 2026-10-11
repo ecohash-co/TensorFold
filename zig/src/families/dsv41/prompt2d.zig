@@ -26,6 +26,7 @@ const round2d = @import("round2d.zig");
 const round_rows = @import("round.zig").max_rows;
 const Link = @import("link.zig").Link;
 const Comm = @import("comm.zig").Comm;
+const ovl = @import("ovl.zig");
 
 const nccl = cuda.nccl;
 
@@ -295,6 +296,13 @@ pub const Two = struct {
     /// its part and receives its own rows of theirs (one NCCL group of send / recv): ~3 n / 4 rows of one part in,
     /// where quarters takes 3 n; only bytes move.
     pub fn toOwners(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, o: Owners, w: [2]usize, esize: usize) !void {
+        try t.toOwnersSend(e, e.s, src, o, w, esize);
+        try t.toOwnersCopy(e, src, dst, o, w, esize);
+    }
+
+    /// toOwners' transfers (its NCCL part) on stream `s`: every other owner's rows of `src` to it, this node's rows of
+    /// theirs into `parts`. This node's own rows of `src` are not read (TF_DS_PROMPT_OVL=wob computes them meanwhile).
+    pub fn toOwnersSend(t: *const Two, e: *const prompt.Engine, s: cuda.Stream, src: u64, o: Owners, w: [2]usize, esize: usize) !void {
         if (!o.valid()) return error.BadOwnerRows;
         const me = t.r + 2 * t.p;
         if (o.rows(3) * @max(w[0], w[1]) * esize > t.part_bytes) return error.PartTooBig;
@@ -308,7 +316,7 @@ pub const Two = struct {
                 const xr = ownerExchange(me, st.from, o, w, esize);
                 const s1 = [1]Comm.P2p{.{ .ptr = src + xs.send_off, .count = xs.send_bytes, .peer = @intCast(st.to) }};
                 const r1 = [1]Comm.P2p{.{ .ptr = t.parts + xr.recv_off, .count = xr.recv_bytes, .peer = @intCast(st.from) }};
-                try e.comm.sendRecv(&s1, &r1, .u8, e.s);
+                try e.comm.sendRecv(&s1, &r1, .u8, s);
             }
         } else {
             var sends: [3]Comm.P2p = undefined;
@@ -321,8 +329,13 @@ pub const Two = struct {
                 recvs[k] = .{ .ptr = t.parts + x.recv_off, .count = x.recv_bytes, .peer = @intCast(h) };
                 k += 1;
             }
-            try e.comm.sendRecv(&sends, &recvs, .u8, e.s);
+            try e.comm.sendRecv(&sends, &recvs, .u8, s);
         }
+    }
+
+    /// toOwners' copies into dst (on the compute stream, after the transfers).
+    pub fn toOwnersCopy(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, o: Owners, w: [2]usize, esize: usize) !void {
+        const me = t.r + 2 * t.p;
         for (ownerCopies(me, o, w, esize)) |cp| {
             const base = if (cp.from == me) src else t.parts;
             try e.ops.copyRows(e.s, base + cp.src_off, cp.src_ld, dst + cp.dst_off, cp.dst_ld, cp.bytes, o.rows(me));
@@ -343,8 +356,28 @@ pub const Two = struct {
     pub fn woB(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
         try t.catRank(e, ch.u, t.u_full, ch.n, t.uw, 2);
         try prompt.pm(e, .comm);
-        try prompt.mm(e, ch, lay.wo_b, t.u_full, t.uw[0] + t.uw[1], ch.pa, .fp32, lay.wo_b.n);
+        const k = t.uw[0] + t.uw[1];
+        if (e.side) |sd| if (sd.lv.wob) if (ch.sp) |sp| if (ovl.ownFirst(sp.owners(), sp.g)) |ps| {
+            // TF_DS_PROMPT_OVL=wob: wo_b of the other owners' rows, their transfers on the comm stream (toOwnersSend
+            // reads no row of this node's), wo_b of this node's rows meanwhile; prompt.gather waits, then copies
+            for ([_]ovl.Range{ ps[1], ps[2] }) |r| if (r.rows != 0) try t.woBRows(e, ch, lay, k, r);
+            try prompt.pm(e, .dense);
+            try sd.fork(e.s);
+            try t.toOwnersSend(e, sd.stream, ch.pa, sp.owners(), t.ow, 4);
+            try sd.end(.wob);
+            try t.woBRows(e, ch, lay, k, ps[0]);
+            try prompt.pm(e, .dense);
+            ch.wob_sent = true;
+            return;
+        };
+        try prompt.mm(e, ch, lay.wo_b, t.u_full, k, ch.pa, .fp32, lay.wo_b.n);
         try prompt.pm(e, .dense);
+    }
+
+    /// wo_b of rows [r.r0, + r.rows): the same prompt GEMM on those rows (each output row depends on its own input row
+    /// alone: the kernel's tiles are row blocks, its K loop the same for every row).
+    fn woBRows(t: *const Two, e: *const prompt.Engine, ch: *const prompt.Chunk, lay: weights.Layer, k: usize, r: ovl.Range) !void {
+        try prompt.mmRowsAt(e, ch, r.rows, lay.wo_b, t.u_full + r.r0 * k * 2, k, ch.pa + r.r0 * lay.wo_b.n * 4, .fp32, lay.wo_b.n);
     }
 
     /// moe_2d's experts after the routing: this node's gate / up blocks, the rank's whole intermediate assembled, down
@@ -434,6 +467,34 @@ pub const Two = struct {
         try e.comm.sendRecv(&s2, &r2, .u8, e.s);
         for (pl.copies) |cp| try e.ops.copyRows(e.s, tmp + cp.src_off, cp.src_ld, kv + cp.dst_off, cp.dst_ld, cp.bytes, cp.rows);
         try prompt.pm(e, .comm);
+    }
+
+    /// engramSumSp's first half on stream `s` (TF_DS_PROMPT_OVL=engram, the comm stream): step 1 with the row partner
+    /// and the adds, the same transfers and the same add2Bf16 launches as engramSumSp (engramPlan).
+    pub fn engramSp1(t: *const Two, e: *const prompt.Engine, s: cuda.Stream, src: u64, tmp: u64, o: Owners) !void {
+        if (!o.valid()) return error.BadOwnerRows;
+        const me = t.r + 2 * t.p;
+        const pl = engramPlan(me, o, t.ew);
+        if (pl.tmp_bytes > o.n * (t.ew[t.p] * 6 + t.ew[1 - t.p] * 2)) return error.PartTooBig;
+        var s1: [2]Comm.P2p = undefined;
+        var r1: [2]Comm.P2p = undefined;
+        for (0..2) |j| {
+            s1[j] = .{ .ptr = src + pl.s1_send[j].off, .count = pl.s1_send[j].bytes, .peer = @intCast(pl.row_peer) };
+            r1[j] = .{ .ptr = tmp + pl.s1_recv[j].off, .count = pl.s1_recv[j].bytes, .peer = @intCast(pl.row_peer) };
+        }
+        try e.comm.sendRecv(&s1, &r1, .u8, s);
+        for (pl.adds) |ad| try e.ops.add2Bf16(s, src + ad.mine, tmp + ad.other, tmp + ad.out, ad.count);
+    }
+
+    /// engramSumSp's second half on stream `s`: step 2 with the column partner and the copies into kv's owned rows.
+    pub fn engramSp2(t: *const Two, e: *const prompt.Engine, s: cuda.Stream, tmp: u64, kv: u64, o: Owners) !void {
+        if (!o.valid()) return error.BadOwnerRows;
+        const me = t.r + 2 * t.p;
+        const pl = engramPlan(me, o, t.ew);
+        const s2 = [1]Comm.P2p{.{ .ptr = tmp + pl.s2_send.off, .count = pl.s2_send.bytes, .peer = @intCast(pl.col_peer) }};
+        const r2 = [1]Comm.P2p{.{ .ptr = tmp + pl.s2_recv.off, .count = pl.s2_recv.bytes, .peer = @intCast(pl.col_peer) }};
+        try e.comm.sendRecv(&s2, &r2, .u8, s);
+        for (pl.copies) |cp| try e.ops.copyRows(s, tmp + cp.src_off, cp.src_ld, kv + cp.dst_off, cp.dst_ld, cp.bytes, cp.rows);
     }
 
     /// Engram's projection summed over the ranks from its column quarters (model.py esum): the gathered width.

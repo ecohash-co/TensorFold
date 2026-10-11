@@ -168,6 +168,8 @@ pub const Api = struct {
     cuMemsetD8Async: *const fn (DevicePtr, u8, usize, Stream) callconv(.c) R,
     cuMemsetD32Async: *const fn (DevicePtr, c_uint, usize, Stream) callconv(.c) R,
     cuStreamCreate: *const fn (*Stream, c_uint) callconv(.c) R,
+    cuStreamCreateWithPriority: *const fn (*Stream, c_uint, c_int) callconv(.c) R,
+    cuCtxGetStreamPriorityRange: *const fn (*c_int, *c_int) callconv(.c) R,
     cuStreamDestroy_v2: *const fn (Stream) callconv(.c) R,
     cuStreamSynchronize: *const fn (Stream) callconv(.c) R,
     cuStreamWaitEvent: *const fn (Stream, Event, c_uint) callconv(.c) R,

@@ -15,6 +15,17 @@ pub const Stream = struct {
         return .{ .d = d, .handle = s };
     }
 
+    /// A stream at the context's greatest priority (cuCtxGetStreamPriorityRange): the block scheduler dispatches its
+    /// pending blocks before a lower-priority stream's (no preemption of running ones).
+    pub fn initGreatest(d: *const Driver, non_blocking: bool) Error!Stream {
+        var least: c_int = 0;
+        var greatest: c_int = 0;
+        try d.check(d.api.cuCtxGetStreamPriorityRange(&least, &greatest), "cuCtxGetStreamPriorityRange");
+        var s: abi.Stream = null;
+        try d.check(d.api.cuStreamCreateWithPriority(&s, if (non_blocking) abi.stream_non_blocking else 0, greatest), "cuStreamCreateWithPriority");
+        return .{ .d = d, .handle = s };
+    }
+
     pub fn deinit(self: *Stream) void {
         _ = self.d.api.cuStreamDestroy_v2(self.handle);
         self.* = undefined;

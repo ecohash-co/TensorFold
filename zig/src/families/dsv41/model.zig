@@ -30,6 +30,7 @@ const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
 const pprof_mod = @import("pprof.zig");
+const ovl = @import("ovl.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -81,6 +82,14 @@ pub fn promptA2a() !bool {
     if (s.len == 0 or std.mem.eql(u8, s, "group")) return false;
     if (std.mem.eql(u8, s, "shift")) return true;
     return error.BadPromptA2a;
+}
+
+/// TF_DS_PROMPT_OVL (four-node split, with SP rows; ovl.zig): some of an SP chunk's exchanges on a comm stream beside
+/// the compute stream, under compute that does not read them yet: a comma list of engram (needs TF_DS_PROMPT_ENGRAM=sp),
+/// xag, wob, prio, or all. Unset / "" / "off": none, as served. Any other value refuses to start.
+pub fn promptOvl() !ovl.Levers {
+    const v = std.c.getenv("TF_DS_PROMPT_OVL") orelse return .{};
+    return ovl.parse(std.mem.span(v));
 }
 
 /// TF_DS_PROMPT_OVERLAP=1 (four-node split, with TF_DS_PROMPT_CHUNK=4096): an encoder-only pass's two chunks run one
@@ -252,6 +261,7 @@ pub const Model = struct {
     sp_mode: prompt.SpMode = .off, // which chunks take them (spMode)
     pprof: ?*pprof_mod.Prof = null, // TF_DS_PROMPT_PROF=1: the prompt chunks' GPU time by phase
     rdma_rings: ?ring2d.Rings = null,
+    ovl_side: ?ovl.Side = null, // TF_DS_PROMPT_OVL: the comm stream, its events and the launch order (promptOvl)
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
@@ -307,6 +317,7 @@ pub const Model = struct {
         m.sp_rows = spRows();
         m.sp_mode = spMode();
         m.pprof = null;
+        m.ovl_side = null;
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
@@ -323,6 +334,11 @@ pub const Model = struct {
         errdefer m.cache_file.close(io);
         var sp = try prompt2d.split(o.rank, o.world);
         sp.parity = sp.pair != null and parityGU(); // TF_DS_2D_GU=parity: the balanced experts split
+        const ovl_lv = try promptOvl(); // (a bad value refuses to start before anything loads)
+        if (ovl_lv.any()) {
+            if (sp.pair == null) return error.OvlNeedsTheFourNodeSplit;
+            if (promptOverlap()) return error.OvlWithOverlap;
+        }
         m.w = try weights.load(gpa, d, .{ .cache = .{ .file = m.cache_file, .index = &m.ix, .io = io } }, c.*, sp, o.drafts);
         errdefer m.w.deinit();
         if (o.drafts and m.w.dspark == null) return error.NoDrafter;
@@ -408,6 +424,13 @@ pub const Model = struct {
             m.two.?.a2a_shift = try promptA2a();
             if (m.two.?.engram_sp) std.log.info("TF_DS_PROMPT_ENGRAM=sp: Engram sums on owned rows ({s})", .{if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset"});
             if (m.two.?.a2a_shift) std.log.info("TF_DS_PROMPT_A2A=shift: toOwners in three shift steps ({s})", .{if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset"});
+            if (ovl_lv.any()) {
+                // TF_DS_PROMPT_OVL: the engram lever splits engramSumSp (its plan), so it needs TF_DS_PROMPT_ENGRAM=sp
+                if (ovl_lv.engram and !m.two.?.engram_sp) return error.OvlEngramNeedsEngramSp;
+                m.ovl_side = try ovl.Side.init(d, ovl_lv);
+                var nb: [64]u8 = undefined;
+                std.log.info("TF_DS_PROMPT_OVL={s}: exchanges on a comm stream beside compute ({s})", .{ ovl_lv.names(&nb), if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset" });
+            }
             if (o.rdma_devices) |devs| {
                 const image: []const u8 = if (o.rdma_kernels) |path|
                     try std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 26), .@"16", null)
@@ -548,6 +571,11 @@ pub const Model = struct {
             p.deinit();
             m.gpa.destroy(p);
             m.pprof = null;
+        }
+        if (m.ovl_side) |*x| {
+            x.stream.synchronize() catch {};
+            x.deinit();
+            m.ovl_side = null;
         }
         if (m.ov) |ov| {
             ov.stream.synchronize() catch {};
@@ -784,6 +812,18 @@ pub const Model = struct {
         ch.sp = null;
         if (m.two) |t| ch.sp = prompt.spFor(m.sp_mode, t.r + 2 * t.p, n, start, replay, ch.spans.len);
         if (pp) |p| p.sp = if (ch.sp) |x| (if (x.cut) "rows2-cut" else if (x.n == 4 * x.q) "rows" else "rows2") else "off";
+        // TF_DS_PROMPT_OVL: the comm stream and one launch order for this SP chunk alone (the same choice on every
+        // rank: ch.sp depends on n, start, replay and the spans); every other chunk and every round as served
+        const sd: ?*ovl.Side = if (m.ovl_side != null and ch.sp != null) &m.ovl_side.? else null;
+        if (sd) |x| {
+            x.reset();
+            m.comm.order = &x.order;
+        }
+        m.eng.side = sd;
+        defer {
+            m.eng.side = null;
+            m.comm.order = null;
+        }
         if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
         if (pt) |t| try t.mark(m.stream, .embed);
         try prompt.pm(e, .other);
@@ -826,13 +866,18 @@ pub const Model = struct {
             }
             if (e.w.layers[li].engram_wkv != null) {
                 const eh = if (m.eh) |*x| x else return error.NoEngramTables;
-                if (ahead) |th| {
-                    th.join();
-                    ahead = null;
+                if (ch.engram_staged != null and ch.engram_staged.? == li) {
+                    // TF_DS_PROMPT_OVL=engram: projected and summed a layer early (engramStage1 / 2)
+                    try prompt.engramFinish(e, ch, li);
+                } else {
+                    if (ahead) |th| {
+                        th.join();
+                        ahead = null;
+                    }
+                    try prompt.pm(e, .host); // (the GPU's wait for the read-ahead, if it was behind)
+                    if (eh.ahead_err) |err| return err;
+                    try prompt.engramApply(e, ch, eh, li, seq);
                 }
-                try prompt.pm(e, .host); // (the GPU's wait for the read-ahead, if it was behind)
-                if (eh.ahead_err) |err| return err;
-                try prompt.engramApply(e, ch, eh, li, seq);
                 const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
                 const ne = @min(2, c.engram_layers.slice().len);
                 if (j + 1 < ne) {
@@ -851,13 +896,27 @@ pub const Model = struct {
             }
             // a DSpark tap reads the streams after the layer's Engram (_forward_k's order)
             if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j);
-            try prompt.attnMixes(e, ch, li);
+            try prompt.attnMixesX(e, ch, li, true);
+            // TF_DS_PROMPT_OVL=engram: the next layer's Engram projection, and its sum's step 1 on the comm stream
+            // under this layer's attention (its rows joined from the read-ahead here, a layer early)
+            const staged: ?usize = if (sd != null and sd.?.lv.engram and ch.sp != null) ovl.engramAhead(c.engram_layers.slice(), li, c.layers / 2) else null;
+            if (staged) |nx| {
+                const eh = if (m.eh) |*x| x else return error.NoEngramTables;
+                if (ahead) |th| {
+                    th.join();
+                    ahead = null;
+                }
+                if (eh.ahead_err) |err| return err;
+                try prompt.engramStage1(e, ch, eh, nx, seq);
+            }
             if (pt) |t| try t.mark(m.stream, .mix_attn);
             try prompt.attention(e, ch, &m.view, &shared, li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
             if (pt) |t| try t.mark(m.stream, .attn);
             try prompt.gather(e, ch, ch.pa, ch.ga);
             if (pt) |t| try t.mark(m.stream, .gather_a);
             try prompt.ffnMixes(e, ch, li);
+            // its step 2 on the comm stream under this layer's experts
+            if (staged) |nx| try prompt.engramStage2(e, ch, nx);
             if (pt) |t| try t.mark(m.stream, .mix_ffn);
             try prompt.moe(e, ch, li);
             if (pt) |t| try t.mark(m.stream, .moe);

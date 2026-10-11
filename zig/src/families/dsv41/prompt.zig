@@ -36,6 +36,7 @@ const exl3_linear = @import("exl3_linear.zig");
 const prompt2d = @import("prompt2d.zig");
 const rdma = @import("rdma.zig");
 const pprof = @import("pprof.zig");
+const ovl = @import("ovl.zig");
 
 /// The indexer's [rows, n_comp] keys a row block holds at most (model.py: rb * n_comp <= 2^26 / 4 past 16 rows).
 const key_elems: usize = 1 << 24;
@@ -130,6 +131,7 @@ pub const Engine = struct {
     par: ?*const exl3_experts2d.ParKernels = null, // the parity split's gate / up in one launch (null: the served two)
     x2: ?*const exl3_prompt.Kernels = null, // TF_DS_EXL3_PROMPT=v2: a 2D node's prompt-chunk expert GEMMs (exl3_prompt.zig)
     prof: ?*pprof.Prof = null, // TF_DS_PROMPT_PROF=1: the chunk's phase marks (set by fillChunk for the chunk alone)
+    side: ?*ovl.Side = null, // TF_DS_PROMPT_OVL: the comm stream (set by fillChunk for an SP chunk alone; null: as served)
 
     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.
@@ -331,6 +333,12 @@ pub const Chunk = struct {
     // SP rows (TF_DS_PROMPT_SP=rows, model.fillChunk): the mixes run on this node's quarter of the rows (Sp), the
     // partials go to the rows' owners (Two.toOwners) and x is all-gathered; null: every node mixes every row.
     sp: ?Sp = null,
+    // TF_DS_PROMPT_OVL (Engine.side): an exchange on the comm stream whose reader has not waited for it yet: the x
+    // all-gather (attnMixesX -> attention), toOwners of wo_b's partial (Two.woB -> gather), and the Engram layer whose
+    // projection and sum were issued a layer early (engramStage1 / engramStage2 -> engramFinish)
+    xag_sent: bool = false,
+    wob_sent: bool = false,
+    engram_staged: ?usize = null,
 
     /// Every buffer for `cap` rows from `a`, the compressed layers' for chunks ending by position `tokens`; the scratch
     /// the served build zeros (or fills with -1) is set the same.
@@ -731,6 +739,9 @@ pub fn begin(e: *const Engine, ch: *Chunk, ids: []const i64, start: usize, host_
     ch.pending = false;
     ch.sub_rows = 0; // (a pass of two chunks and SP rows are the caller's to set, chunk by chunk)
     ch.sp = null;
+    ch.xag_sent = false;
+    ch.wob_sent = false;
+    ch.engram_staged = null;
     for (host_pos[0..n], 0..) |*p, i| p.* = @intCast(start + i);
     try upload(e, ch.ids, ids.ptr, n * 8);
     ch.pos = ch.pos0;
@@ -760,6 +771,12 @@ fn swapStreams(ch: *Chunk, src: u64) void {
 /// Layer `li`'s attention mixes: x = RMSNorm of the streams mixed by pre, pre_a / post / comb from their own mixes;
 /// with a pending MoE gather, hc_pre_pf posts it into the streams first.
 pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
+    return attnMixesX(e, ch, li, false);
+}
+
+/// attnMixes; `side_ok` (fillChunk's layers, whose attention reads x next): with TF_DS_PROMPT_OVL=xag on an SP chunk
+/// the x all-gather goes on the comm stream and attention runs its front on this node's rows meanwhile.
+pub fn attnMixesX(e: *const Engine, ch: *Chunk, li: usize, side_ok: bool) !void {
     const lay = e.w.layers[li];
     const c = e.c;
     const v = mixView(e, ch);
@@ -771,6 +788,16 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
         try tri_basic.hcPre(e.t, v.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], v.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, v.x, v.pre_a, v.post, v.comb, ch.part, v.rows, c.hidden);
     }
     try pm(e, .mix);
+    if (side_ok) if (e.side) |sd| if (sd.lv.xag) if (ch.sp) |sp| if (ovl.ownFirst(sp.owners(), sp.g) != null) {
+        // TF_DS_PROMPT_OVL=xag: the same all-gather (and rows2 tail) on the comm stream after this node's mixes
+        const d = e.c.hidden;
+        try sd.fork(e.s);
+        try e.comm.allGather(ch.x + sp.g * sp.q * d * 2, ch.x, sp.q * d, .bf16, sd.stream);
+        try spTail(e, sp, ch.x, d * 2, sd.stream);
+        try sd.end(.xag);
+        ch.xag_sent = true;
+        return;
+    };
     try spGatherX(e, ch);
 }
 
@@ -805,13 +832,13 @@ fn spGatherX(e: *const Engine, ch: *const Chunk) !void {
     const d = e.c.hidden;
     try e.comm.allGather(ch.x + sp.g * sp.q * d * 2, ch.x, sp.q * d, .bf16, e.s);
     // rows2's uneven split: node 3's rows past 4 q (under 64) to the other three, by send / recv (bytes)
-    try spTail(e, sp, ch.x, d * 2);
+    try spTail(e, sp, ch.x, d * 2, e.s);
     try pm(e, .comm);
 }
 
 /// rows [4 q, n) of `buf` (rows of `row` bytes; node 3's past the all-gather's equal parts) from node 3 to the other
-/// three, in place; nothing when the split is even.
-fn spTail(e: *const Engine, sp: Sp, buf: u64, row: usize) !void {
+/// three, in place, on stream `s`; nothing when the split is even.
+fn spTail(e: *const Engine, sp: Sp, buf: u64, row: usize, s: cuda.Stream) !void {
     const o = sp.owners();
     const t = o.tail();
     if (t[1] == 0) return;
@@ -824,10 +851,10 @@ fn spTail(e: *const Engine, sp: Sp, buf: u64, row: usize) !void {
             xs[k] = .{ .ptr = at, .count = bytes, .peer = @intCast(h) };
             k += 1;
         }
-        return e.comm.sendRecv(xs[0..k], &.{}, .u8, e.s);
+        return e.comm.sendRecv(xs[0..k], &.{}, .u8, s);
     }
     xs[0] = .{ .ptr = at, .count = bytes, .peer = 3 };
-    return e.comm.sendRecv(&.{}, xs[0..1], .u8, e.s);
+    return e.comm.sendRecv(&.{}, xs[0..1], .u8, s);
 }
 
 /// rows2 at the replay cut: rows [first, n) of the streams h and of pre (the decoder layers' inputs; each node holds
@@ -897,6 +924,11 @@ fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u6
     try grouped(e, ch, m, &.{l}, &.{x}, &.{ldx}, &.{out}, &.{os}, &.{dt});
 }
 
+/// mmRows for a caller outside this file (Two.woB's row parts): the same launch.
+pub fn mmRowsAt(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
+    return mmRows(e, ch, m, l, x, ldx, out, out_type, os);
+}
+
 /// mm of the chunk's rows.
 pub fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
     try mmRows(e, ch, ch.n, l, x, ldx, out, out_type, os);
@@ -919,17 +951,30 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     // ring mode (a chunk of RING_EXTRA rows or fewer): the rows' keys into the ring first, the attention reads the ring
     const ring_mode = n <= ring_extra;
     // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to 128 rows
-    if (n > 128) {
-        try mm(e, ch, lay.wq_a, ch.x, c.hidden, ch.qa, .bf16, lay.wq_a.n);
-        try mm(e, ch, lay.wkv, ch.x, c.hidden, ch.y, .bf16, hd);
+    if (ch.xag_sent) {
+        // TF_DS_PROMPT_OVL=xag (attnMixesX sent x's all-gather on the comm stream): the row-local front on this
+        // node's own rows (here already), then on the rest once the all-gather has landed; every launch the same
+        // prompt GEMM / RMSNorm on fewer rows (ownFirst keeps each part above the GEMM's 128 rows)
+        const sp = ch.sp orelse return error.NotAnSpChunk;
+        const ps = ovl.ownFirst(sp.owners(), sp.g) orelse return error.NotAnSpChunk;
+        try attnFront(e, ch, lay, ps[0]);
+        try e.side.?.join(e.s, .xag);
+        ch.xag_sent = false;
+        try pm(e, .comm);
+        for ([_]ovl.Range{ ps[1], ps[2] }) |r| if (r.rows != 0) try attnFront(e, ch, lay, r);
     } else {
-        try grouped(e, ch, n, &.{ lay.wq_a, lay.wkv }, &.{ ch.x, ch.x }, &.{ c.hidden, c.hidden }, &.{ ch.qa, ch.y }, &.{ lay.wq_a.n, hd }, &.{ .bf16, .bf16 });
+        if (n > 128) {
+            try mm(e, ch, lay.wq_a, ch.x, c.hidden, ch.qa, .bf16, lay.wq_a.n);
+            try mm(e, ch, lay.wkv, ch.x, c.hidden, ch.y, .bf16, hd);
+        } else {
+            try grouped(e, ch, n, &.{ lay.wq_a, lay.wkv }, &.{ ch.x, ch.x }, &.{ c.hidden, c.hidden }, &.{ ch.qa, ch.y }, &.{ lay.wq_a.n, hd }, &.{ .bf16, .bf16 });
+        }
+        try pm(e, .dense);
+        try tri_basic.rmsnorm(e.t, ch.qa, lay.wq_a.n, lay.q_norm, ch.qr, lay.wq_a.n, c.eps, n, lay.wq_a.n);
+        try pm(e, .mix);
+        try mm(e, ch, lay.wq_b, ch.qr, lay.wq_a.n, ch.q, .bf16, hl * hd);
+        try pm(e, .dense);
     }
-    try pm(e, .dense);
-    try tri_basic.rmsnorm(e.t, ch.qa, lay.wq_a.n, lay.q_norm, ch.qr, lay.wq_a.n, c.eps, n, lay.wq_a.n);
-    try pm(e, .mix);
-    try mm(e, ch, lay.wq_b, ch.qr, lay.wq_a.n, ch.q, .bf16, hl * hd);
-    try pm(e, .dense);
     try tri_norm.ropeHeads(e.t, ch.q, rope.cos, rope.sin, ch.pos, rd, false, n, hl, hd);
     // the window keys: the ring's last window - 1 positions before start, then this chunk's rows
     const lo = @max(floor, start -| (c.window - 1));
@@ -1037,6 +1082,23 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     try pm(e, .dense);
     if (e.two) |t| return t.woB(e, ch, lay); // 2D: the column partner's groups first, then this pair's columns
     try mm(e, ch, lay.wo_b, ch.u, uw, ch.pa, .fp32, c.hidden);
+    try pm(e, .dense);
+}
+
+/// attention's row-local front on rows [r.r0, + r.rows) (TF_DS_PROMPT_OVL=xag): wq_a and wkv of x, q_norm, wq_b, the
+/// launches attention makes on every row, each on these rows (r.rows > 128: the prompt GEMM, as for the whole chunk).
+fn attnFront(e: *const Engine, ch: *Chunk, lay: weights.Layer, r: ovl.Range) !void {
+    const c = e.c;
+    const hd = c.head_dim;
+    const qn = lay.wq_a.n;
+    const qw = e.heads() * hd;
+    if (r.rows <= ovl.gemm_min_rows) return error.RowPartTooSmall;
+    try mmRows(e, ch, r.rows, lay.wq_a, ch.x + r.r0 * c.hidden * 2, c.hidden, ch.qa + r.r0 * qn * 2, .bf16, qn);
+    try mmRows(e, ch, r.rows, lay.wkv, ch.x + r.r0 * c.hidden * 2, c.hidden, ch.y + r.r0 * hd * 2, .bf16, hd);
+    try pm(e, .dense);
+    try tri_basic.rmsnorm(e.t, ch.qa + r.r0 * qn * 2, qn, lay.q_norm, ch.qr + r.r0 * qn * 2, qn, c.eps, r.rows, qn);
+    try pm(e, .mix);
+    try mmRows(e, ch, r.rows, lay.wq_b, ch.qr + r.r0 * qn * 2, qn, ch.q + r.r0 * qw * 2, .bf16, qw);
     try pm(e, .dense);
 }
 
@@ -1253,11 +1315,19 @@ pub fn scale(hd: usize) f32 {
 }
 
 /// Comm.gather: [world, n, D] fp32 of every rank's partial, in rank order.
-pub fn gather(e: *const Engine, ch: *const Chunk, src: u64, dst: u64) !void {
+pub fn gather(e: *const Engine, ch: *Chunk, src: u64, dst: u64) !void {
     defer pm(e, .comm) catch {};
     if (e.two) |t| {
         // SP rows: [2, rows, D] of the rows this node owns (its mixes post only those)
-        if (ch.sp) |sp| return t.toOwners(e, src, dst, sp.owners(), t.ow, 4);
+        if (ch.sp) |sp| {
+            if (ch.wob_sent and src == ch.pa) {
+                // TF_DS_PROMPT_OVL=wob: Two.woB sent the transfers on the comm stream; wait, then the copies
+                try e.side.?.join(e.s, .wob);
+                ch.wob_sent = false;
+                return t.toOwnersCopy(e, src, dst, sp.owners(), t.ow, 4);
+            }
+            return t.toOwners(e, src, dst, sp.owners(), t.ow, 4);
+        }
         return t.quarters(e, src, dst, ch.n, t.ow, 4); // 2D: the same [2, n, D] from the four quarters
     }
     try e.comm.allGather(src, dst, ch.n * e.c.hidden, .f32, e.s);
@@ -1514,6 +1584,78 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
         eh.p_gate += lap(e, eh, &tq);
         eh.p_calls += 1;
     }
+}
+
+/// TF_DS_PROMPT_OVL=engram, issued at layer li - 1 of an SP chunk (after its attention mixes): Engram layer li's rows
+/// (read ahead or read here, as engramApply), their upload and projection on the compute stream, then on the comm stream
+/// engramSumSp's step 1 and adds (Two.engramSp1). The projection reads only the token ids' rows and the layer's weights,
+/// so issuing it a layer early changes no operand; the sum's transfers and adds are engramSumSp's.
+pub fn engramStage1(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq: []const i32) !void {
+    const lay = e.w.layers[li];
+    const ew = lay.engram_wkv orelse return error.NotAnEngramLayer;
+    const c = e.c;
+    const n = ch.n;
+    const sp = ch.sp orelse return error.NotAnSpChunk;
+    const two = e.two orelse return error.NotA2DSplit;
+    const sd = e.side orelse return error.NoCommStream;
+    if (ch.spans.len > 0) return error.SpWithImages;
+    if (!two.engram_sp or (two.rings != null and n < 64)) return error.OvlEngramNeedsEngramSp;
+    const l = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)) orelse return error.NotAnEngramLayer;
+    const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
+    const cols = eh.hasher.cols();
+    const k = eh.hi - eh.lo;
+    const m = n * k;
+    var rows: []u16 = eh.rows;
+    if (l < 2 and eh.ahead_ready[l] and ch.start >= eh.ahead_start and ch.start + n <= eh.ahead_start + eh.ahead_n) {
+        rows = eh.ahead_rows[l][(ch.start - eh.ahead_start) * k * t.row_w ..];
+        if (ch.start + n == eh.ahead_start + eh.ahead_n) eh.ahead_ready[l] = false;
+    } else {
+        eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
+        for (0..n) |r| {
+            for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
+        }
+        if (eh.paio) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
+        engram.decodeRows(eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s], eh.rows[0 .. m * t.row_w], m, t.row_w, t.row_s, 8);
+    }
+    if (m * t.row_w != n * ew.k) return error.EngramShape;
+    try pm(e, .host);
+    try upload(e, ch.eb, rows.ptr, m * t.row_w * 2);
+    try mm(e, ch, ew, ch.eb, ew.k, ch.ek, .fp32, ew.n);
+    try pm(e, .engram);
+    try sd.fork(e.s);
+    try two.engramSp1(e, sd.stream, ch.ek, ch.ekg, sp.owners());
+    ch.engram_staged = li;
+}
+
+/// TF_DS_PROMPT_OVL=engram, at layer li - 1 after its FFN mixes: the staged sum's step 2 and copies into kv's owned rows
+/// on the comm stream (Two.engramSp2), then the segment's end event.
+pub fn engramStage2(e: *const Engine, ch: *Chunk, li: usize) !void {
+    if (ch.engram_staged != li) return error.EngramNotStaged;
+    const sp = ch.sp orelse return error.NotAnSpChunk;
+    const sd = e.side orelse return error.NoCommStream;
+    try e.two.?.engramSp2(e, sd.stream, ch.ekg, ch.kv, sp.owners());
+    try sd.end(.engram);
+}
+
+/// TF_DS_PROMPT_OVL=engram at Engram layer li (in place of engramApply): the pending MoE post into the streams (as
+/// engramApply), the wait for the staged sum, then the gate on this node's rows of the streams and of kv.
+pub fn engramFinish(e: *const Engine, ch: *Chunk, li: usize) !void {
+    if (ch.engram_staged != li) return error.EngramNotStaged;
+    const lay = e.w.layers[li];
+    const c = e.c;
+    const v = mixView(e, ch);
+    if (ch.pending) {
+        try tri_basic.hcPost(e.t, ch.gm, v.h, v.post, v.comb, v.h, e.world, v.rows, c.hidden);
+        ch.pending = false;
+    }
+    try pm(e, .mix);
+    const en = e.two.?.engramWidth();
+    try e.side.?.join(e.s, .engram);
+    ch.engram_staged = null;
+    try pm(e, .comm);
+    try tri_basic.engramGate(e.t, v.h, ch.kv + v.r0 * en * 2, lay.engram_qk, v.h_alt, c.eps, v.rows, c.hidden);
+    swapStreams(ch, ch.h_alt);
+    try pm(e, .engram);
 }
 
 /// A profile's clock after the stream drains (prompt Engram split).

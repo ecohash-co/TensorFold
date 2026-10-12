@@ -400,6 +400,14 @@ pub const Model = struct {
             if (promptOverlap()) return error.EngramPrefetchWithOverlap;
             if (!o.engram_aio) return error.EngramPrefetchNeedsAio;
         }
+        // TF_DS_ENGRAM_SPLIT (stage ZE4; likewise): column partners split each chunk's reads in the prefetch's reader,
+        // so it needs the prefetch and the four-node split (partners g and g ^ 2)
+        const es_set = try engram_pf.splitFromEnv();
+        if (es_set.on()) {
+            if (!epf_set.on()) return error.EngramSplitNeedsPrefetch;
+            if (sp.pair == null or o.world != 4) return error.EngramSplitNeedsTheFourNodeSplit;
+            if (o.engram_dir == null) return error.NoEngramTables;
+        }
         m.w = try weights.load(gpa, d, .{ .cache = .{ .file = m.cache_file, .index = &m.ix, .io = io } }, c.*, sp, o.drafts);
         errdefer m.w.deinit();
         if (o.drafts and m.w.dspark == null) return error.NoDrafter;
@@ -645,6 +653,17 @@ pub const Model = struct {
                 const secs = @as(f64, @floatFromInt(std.Io.Timestamp.now(io, .awake).nanoseconds - t0)) / 1e9;
                 var nb: [32]u8 = undefined;
                 std.log.info("TF_DS_ENGRAM_PREFETCH={s}: prompt Engram rows read up to {d} chunks ahead by a reader of their own ({d} MiB held, {d:.1} s to set up)", .{ epf_set.names(&nb), epf_set.depth, m.epf.?.bytes() >> 20, secs });
+                if (es_set.on()) {
+                    // TF_DS_ENGRAM_SPLIT: the column partner's link (every rank, in this order: the addresses go down
+                    // the Fan's links, which carry nothing else here), then the reader reads its part alone
+                    const t1 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+                    const pl = try engram_pf.pairLink(io, &m.fan.links, o.master, o.port, o.rank, o.world, es_set, eh.lo, eh.hi - eh.lo);
+                    const first = o.rank < 2;
+                    try m.epf.?.usePair(pl.fd, es_set, first);
+                    const s2 = @as(f64, @floatFromInt(std.Io.Timestamp.now(io, .awake).nanoseconds - t1)) / 1e9;
+                    var sb: [16]u8 = undefined;
+                    std.log.info("TF_DS_ENGRAM_SPLIT={s}: column partners split each chunk's Engram reads, this rank reads its {s} part ({s}) and takes the rest from rank {d} over TCP port {d} ({d} MiB held in all, {d:.1} s to link)", .{ es_set.names(&sb), if (first) "first" else "second", if (first) "the share" else "1 - the share", o.rank ^ 2, o.port + engram_pf.pair_port_offset + @as(u16, @intCast(o.rank % 2)), m.epf.?.bytes() >> 20, s2 });
+                }
             }
         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
 
@@ -836,6 +855,12 @@ pub const Model = struct {
 
     /// A stream's prompt is about to fill pool slot `slot`, its compressed rows in its extent from position `base`.
     /// Wait for the next chunk's Engram read-ahead, if one runs (before the prompt it reads changes or goes).
+    /// TF_DS_ENGRAM_SPLIT is on: the prefetch reader shares its reads with a column partner.
+    pub fn splitOn(m: *const Model) bool {
+        const p = m.epf orelse return false;
+        return p.pair != null;
+    }
+
     pub fn joinAhead(m: *Model) void {
         if (m.ahead) |th| th.join();
         m.ahead = null;

@@ -25,6 +25,13 @@
 //!                                               of the chunk the GPU is on, on an AIO ring of its own; scales: the
 //!                                               tables' scale rows in RAM (~6 GiB), the drive reads the weight rows
 //!                                               alone (engram_pf.zig). Unset / "" / off / 0: the served read-ahead
+//!   TF_DS_ENGRAM_SPLIT=<share>                  (stage ZE4; needs TF_DS_ENGRAM_PREFETCH and world 4) column partners
+//!                                               (ranks g, g ^ 2) read IDENTICAL rows: ranks 0/1 read the first share
+//!                                               of each chunk's rows (0.001 .. 1, e.g. 0.5, 0.75, 1), ranks 2/3 the
+//!                                               rest, and each sends its decoded part, with its row ids, to the other
+//!                                               over a TCP link on the fabric (port + 16 + g % 2); a part is taken
+//!                                               only for its own ids, so the bytes are the unsplit read's. Unset / ""
+//!                                               / off: every rank reads all its rows
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
 //!   TF_DS_SERVED_K=all|solo                     a stream verifies at most the served lane's choice of drafts (its
 //!                                               round table and draft ms): at any streams, or one stream alone
@@ -227,6 +234,11 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadEngramPrefetch => "TF_DS_ENGRAM_PREFETCH: a depth 1 .. 32 or prompt, optionally then ,scales (e.g. 2 or 2,scales); unset / off: the served read-ahead",
         error.EngramPrefetchNeedsAio => "TF_DS_ENGRAM_PREFETCH reads by Linux AIO: set TF_DS_ENGRAM_AIO=1 (followers: --aio 1)",
         error.EngramPrefetchWithOverlap => "TF_DS_ENGRAM_PREFETCH does not run with TF_DS_PROMPT_OVERLAP (its passes read their own rows ahead)",
+        error.BadEngramSplit => "TF_DS_ENGRAM_SPLIT: ranks 0/1's share of each chunk's Engram rows, above 0 up to 1 with at most three decimals (e.g. 0.5, 0.75, 1); unset / off: every rank reads all its rows",
+        error.EngramSplitNeedsPrefetch => "TF_DS_ENGRAM_SPLIT splits the prefetch reader's reads: set TF_DS_ENGRAM_PREFETCH too (e.g. 2,scales)",
+        error.EngramSplitNeedsTheFourNodeSplit => "TF_DS_ENGRAM_SPLIT needs the four-node 2D split (TF_TP_WORLD=4): column partners are ranks g and g ^ 2",
+        error.EngramSplitPartner => "TF_DS_ENGRAM_SPLIT: the column partner has another share or other columns (set the same TF_DS_ENGRAM_SPLIT on every node)",
+        error.EngramSplitLink, error.EngramSplitPeerDown, error.EngramSplitFrame => "TF_DS_ENGRAM_SPLIT: the column partners' link failed (each pair-0 rank listens on its fabric address at TF_TP_PORT + 16 + g)",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
@@ -237,5 +249,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadEngramSplit).?, "TF_DS_ENGRAM_SPLIT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.EngramSplitNeedsPrefetch).?, "TF_DS_ENGRAM_PREFETCH") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }

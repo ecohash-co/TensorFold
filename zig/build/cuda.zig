@@ -35,6 +35,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_attn", .src = "dsv41/attn_prompt", .flags = &.{ "-O3", "-lineinfo" } }, // ours: TF_DS_PROMPT_ATTN=tsel's one-launch top-k of the prompt indexer (attn.zig)
     .{ .name = "dsv41_router", .src = "dsv41/router_own", .flags = &.{ "-O3", "--fmad=false", "-lineinfo" } }, // ours: TF_DS_PROMPT_ROUTER=own's gate logits of the own rows with today's cuBLAS run's split-K arithmetic (router.zig)
     .{ .name = "dsv41_p16", .src = "dsv41/p16", .flags = &.{ "-O3", "-lineinfo" } }, // ours: TF_DS_PROMPT_P16=1: the bf16 pack / widen of the SP chunks' owner exchange (p16.zig; integer arithmetic, no float flags matter)
+    .{ .name = "dsv41_mx_prompt", .src = "dsv41/mx_prompt", .flags = &.{"-O3"} }, // ours: stage MX3's MXFP4 prompt experts (mx_prompt.zig): TensorFold's O2 nvfp4/experts_prefill.cu template as it is, with its Python extension's flags (tensorfold_nvfp4_experts_prefill_v2: -O3), the grouping, the slot combine, the shared SwiGLU
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

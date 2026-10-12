@@ -485,6 +485,10 @@ pub const Model = struct {
         errdefer m.freeMx();
         var mx_bytes: usize = 0;
         if (mx_n != 0) {
+            // y lives in ch.xs.z between an MXFP4 layer's down and its combine: v2's EXL3 launches store every Z element
+            // they read (no accumulation into a zeroed Z), so the EXL3 layers after it are unaffected; the served v1
+            // launches are not checked for that, so the knob needs v2 (the served ENGINE_ENV has it)
+            if (m.x2 == null) return error.MxNeedsExl3PromptV2;
             if (!cuda.kernels.available) return error.NoKernelImages;
             m.mx_k = try mx_prompt.Kernels.load(d, cuda.kernels.dsv41_mx_prompt);
             const dir = mx_prompt.dirFromEnv();

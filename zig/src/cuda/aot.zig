@@ -55,14 +55,17 @@ pub fn cf(name: []const u8, v: f32) Const {
     return .{ .name = name, .f32 = v };
 }
 
-const Variant = struct { spec: KernelJson, kernel: triton.Kernel };
+const Variant = struct {
+    spec: KernelJson,
+    kernel: triton.Kernel,
+    /// Said once on stderr when a launch first takes this variant in place of its own specialization.
+    told: std.atomic.Value(bool) = .init(false),
+};
 
-/// What a call site has shown its kernel's code does not depend on, for a launch no variant was captured for exactly:
-/// `ints` may be divisible by 16 where the variant was compiled for any value (never the other way), `ptrs8` may be
-/// 8- but not 16-aligned where the variant assumed 16 (arguments the code reads as one 8-byte scalar, or not at all).
-/// Only constexprs and every other argument's specialization as captured; empty: Triton's exact choice only.
+/// What a call site has shown its kernel's code does not depend on, beyond the fallback `fits` makes for every launch
+/// (homelab, from 969d13b): `ptrs8` may be 8- but not 16-aligned where the variant assumed 16 (arguments the code
+/// reads as one 8-byte scalar, or not at all). Such an argument counts as not held. Empty: upstream's rule only.
 pub const Relax = struct {
-    ints: []const []const u8 = &.{},
     ptrs8: []const []const u8 = &.{},
 
     fn has(names: []const []const u8, name: []const u8) bool {
@@ -71,12 +74,12 @@ pub const Relax = struct {
     }
 };
 
-var relaxed_logged = std.atomic.Value(bool).init(false);
-
 pub const Set = struct {
     parsed: std.json.Parsed(SetJson),
     variants: []Variant,
     gpa: std.mem.Allocator,
+    /// TF_AOT_WEAKEST=1: every launch takes its most general fitting variant (a gate of the fallback's exactness).
+    weakest: bool = false,
 
     /// Loads every cubin listed in `dir`/aot.json into its own module.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, device: abi.Device, dir: []const u8) !Set {
@@ -104,7 +107,8 @@ pub const Set = struct {
             variants[n] = .{ .spec = k, .kernel = try triton.Kernel.load(d, device, cubin, meta, name_z) };
             n += 1;
         }
-        return .{ .parsed = parsed, .variants = variants, .gpa = gpa };
+        const weakest = if (std.c.getenv("TF_AOT_WEAKEST")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        return .{ .parsed = parsed, .variants = variants, .gpa = gpa, .weakest = weakest };
     }
 
     pub fn deinit(self: *Set) void {
@@ -114,24 +118,34 @@ pub const Set = struct {
         self.* = undefined;
     }
 
-    /// The variant of `function` compiled for these constexprs and these arguments' specialization.
+    /// The variant of `function` compiled for these constexprs and these arguments' specialization; without one, the
+    /// fitting variant that assumes least less (fits: the same constexprs, each assumption it makes held by the
+    /// launch), named once on stderr.
     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
         return self.findRelaxed(function, args, consts, .{});
     }
 
-    /// `find`, and without an exact variant the first one whose specialization differs only as `relax` allows.
+    /// `find`, the fallback's fit also allowing what `relax` lists (Relax).
     pub fn findRelaxed(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const, relax: Relax) !*const Variant {
+        if (!self.weakest) for (self.variants) |*v| {
+            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
+            if (matches(v.spec, args, consts)) return v;
+        };
+        var best: ?*Variant = null;
+        var best_held: usize = 0;
         for (self.variants) |*v| {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
-            if (matches(v.spec, args, consts, .{})) return v;
-        }
-        if (relax.ints.len + relax.ptrs8.len > 0) for (self.variants) |*v| {
-            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
-            if (matches(v.spec, args, consts, relax)) {
-                if (!relaxed_logged.swap(true, .monotonic)) std.log.info("no exact captured variant of {s}: took {s} (a specialization its code does not depend on)", .{ function, v.spec.hash });
-                return v;
+            const held = fits(v.spec, args, consts, relax) orelse continue;
+            const better = if (self.weakest) held < best_held else held > best_held;
+            if (best == null or better) {
+                best = v;
+                best_held = held;
             }
-        };
+        }
+        if (best) |v| {
+            if (!v.told.swap(true, .monotonic)) std.log.warn("{s}: a launch whose specialization no captured variant has runs variant {s} (assumes less)", .{ function, v.spec.hash[0..@min(12, v.spec.hash.len)] });
+            return v;
+        }
         std.log.err("no captured Triton variant of {s} for this launch:", .{function});
         for (args) |a| switch (a.value) {
             .ptr => |p| std.log.err("  {s}: {s} at {x} (16-aligned {})", .{ a.name, p.ty, p.addr, p.addr % 16 == 0 }),
@@ -180,7 +194,63 @@ fn lookup(args: []const Arg, name: []const u8) ?Arg {
     return null;
 }
 
-fn matches(k: KernelJson, args: []const Arg, consts: []const Const, relax: Relax) bool {
+/// Whether variant `k` may run this launch though compiled for a narrower one: the same constexprs, and every
+/// assumption it makes held by the launch (an argument it takes as 16-divisible is; an int it folded to 1 is 1), but a
+/// pointer `relax.ptrs8` lists may be 8-aligned where `k` assumed 16. Null when it may not, else how many of the
+/// launch's own specializations it shares.
+fn fits(k: KernelJson, args: []const Arg, consts: []const Const, relax: Relax) ?usize {
+    for (consts) |c| {
+        const got = k.consts.map.get(c.name) orelse return null;
+        if (c.int) |x| if (got.int == null or got.int.? != x) return null;
+        if (c.f32) |x| if (got.f32 == null or got.f32.? != @as(u32, @bitCast(x))) return null;
+    }
+    var held: usize = 0;
+    var runtime: usize = 0;
+    for (args) |a| {
+        const param = for (k.params) |p| {
+            if (std.mem.eql(u8, p.name, a.name)) break p;
+        } else null;
+        switch (a.value) {
+            .i32 => |x| {
+                if (param == null) {
+                    const got = k.consts.map.get(a.name) orelse return null;
+                    if (x != 1 or got.int == null or got.int.? != 1) return null;
+                    held += 1;
+                    continue;
+                }
+                const p = param.?;
+                if (!std.mem.eql(u8, p.type, "i32")) return null;
+                const d16 = !p.nospec and x != 1 and @mod(x, 16) == 0;
+                if (p.div16 and !d16) return null;
+                if (p.div16 == d16 and (p.nospec or x != 1)) held += 1;
+            },
+            .ptr => |x| {
+                const p = param orelse return null;
+                if (!std.mem.eql(u8, p.type, x.ty)) return null;
+                const d16 = x.addr % 16 == 0;
+                if (p.div16 and !d16 and !(x.addr % 8 == 0 and Relax.has(relax.ptrs8, a.name))) return null;
+                if (p.div16 == d16) held += 1;
+            },
+            .f32 => {
+                const p = param orelse return null;
+                if (!std.mem.eql(u8, p.type, "fp32")) return null;
+                held += 1;
+            },
+            .u64 => |x| {
+                const p = param orelse return null;
+                if (!std.mem.eql(u8, p.type, "u64")) return null;
+                const d16 = x % 16 == 0;
+                if (p.div16 and !d16) return null;
+                if (p.div16 == d16) held += 1;
+            },
+        }
+        runtime += 1;
+    }
+    if (runtime != k.params.len) return null;
+    return held;
+}
+
+fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
     for (consts) |c| {
         const got = k.consts.map.get(c.name) orelse return false;
         if (c.int) |x| if (got.int == null or got.int.? != x) return false;
@@ -202,14 +272,11 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const, relax: Relax
                 const p = param.?;
                 if (!std.mem.eql(u8, p.type, "i32")) return false;
                 if (!p.nospec and x == 1) return false;
-                const div16 = !p.nospec and @mod(x, 16) == 0;
-                if (p.div16 != div16 and !(div16 and !p.div16 and Relax.has(relax.ints, a.name))) return false;
+                if (p.div16 != (!p.nospec and @mod(x, 16) == 0)) return false;
             },
             .ptr => |x| {
                 const p = param orelse return false;
-                if (!std.mem.eql(u8, p.type, x.ty)) return false;
-                const al16 = x.addr % 16 == 0;
-                if (p.div16 != al16 and !(p.div16 and x.addr % 8 == 0 and Relax.has(relax.ptrs8, a.name))) return false;
+                if (!std.mem.eql(u8, p.type, x.ty) or p.div16 != (x.addr % 16 == 0)) return false;
             },
             .f32 => {
                 const p = param orelse return false;
@@ -225,33 +292,34 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const, relax: Relax
     return runtime == k.params.len;
 }
 
-test "relaxed matching: div-16 ints onto any-value params and 8-aligned pointers onto 16-aligned ones, only as listed" {
+test "fallback fit: the most specializations held, assumptions never broken; 8-aligned pointers only as listed" {
     const gpa = std.testing.allocator;
     const expect = std.testing.expect;
-    var params = [_]ParamJson{
-        .{ .name = "VIS", .type = "*i64", .div16 = true, .nospec = false },
-        .{ .name = "n", .type = "i32", .div16 = false, .nospec = false },
-    };
-    var k: KernelJson = .{ .@"fn" = "f", .hash = "h", .name = "f", .num_warps = 4, .params = &params, .consts = .{} };
-    defer k.consts.map.deinit(gpa);
-    try k.consts.map.put(gpa, "KEYS", .{ .int = 0 });
+    const P = ParamJson;
+    // _index_score's captured fp32-score shapes, cut to what matters: 5f4f (n, nt any; VIS 16) and 670f (n div 16, nt = 1)
+    var p5 = [_]P{ .{ .name = "VIS", .type = "*i64", .div16 = true, .nospec = false }, .{ .name = "n", .type = "i32", .div16 = false, .nospec = false }, .{ .name = "nt", .type = "i32", .div16 = false, .nospec = false } };
+    var p6 = [_]P{ .{ .name = "VIS", .type = "*i64", .div16 = true, .nospec = false }, .{ .name = "n", .type = "i32", .div16 = true, .nospec = false } };
+    var k5: KernelJson = .{ .@"fn" = "f", .hash = "5f4f", .name = "f", .num_warps = 4, .params = &p5, .consts = .{} };
+    defer k5.consts.map.deinit(gpa);
+    try k5.consts.map.put(gpa, "KEYS", .{ .int = 0 });
+    var k6: KernelJson = .{ .@"fn" = "f", .hash = "670f", .name = "f", .num_warps = 4, .params = &p6, .consts = .{} };
+    defer k6.consts.map.deinit(gpa);
+    try k6.consts.map.put(gpa, "KEYS", .{ .int = 0 });
+    try k6.consts.map.put(gpa, "nt", .{ .int = 1 });
     const consts = [_]Const{ci("KEYS", 0)};
-    const relax: Relax = .{ .ints = &.{"n"}, .ptrs8 = &.{"VIS"} };
-    // the captured key itself, either way
-    try expect(matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421) }, &consts, .{}));
-    try expect(matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421) }, &consts, relax));
-    // n divisible by 16 onto the any-value n: relaxed only, and only when listed
-    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 145152) }, &consts, .{}));
-    try expect(matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 145152) }, &consts, relax));
-    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 145152) }, &consts, .{ .ptrs8 = &.{"VIS"} }));
-    // an 8-aligned VIS onto the 16-aligned one: relaxed only; 4-aligned never
-    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1008), int("n", 146421) }, &consts, .{}));
-    try expect(matches(k, &.{ ptr("VIS", "*i64", 0x1008), int("n", 146421) }, &consts, relax));
-    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1004), int("n", 146421) }, &consts, relax));
-    // the value 1 (a constexpr of its own variant) and other constexprs are never relaxed
-    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 1) }, &consts, relax));
-    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421) }, &.{ci("KEYS", 1)}, relax));
-    // never the other way: a variant compiled for div-16 n does not take n = 146421
-    params[1].div16 = true;
-    try expect(!matches(k, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421) }, &consts, relax));
+    const rx: Relax = .{ .ptrs8 = &.{"VIS"} };
+    // the captured key: exact, and the fit holds all three
+    try expect(matches(k5, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421), int("nt", 2289) }, &consts));
+    try expect(fits(k5, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421), int("nt", 2289) }, &consts, .{}).? == 3);
+    // 146,421 (nt = 2288, div 16): no exact variant; 5f4f fits (nt not held); 670f does not (nt is not 1)
+    try expect(!matches(k5, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421), int("nt", 2288) }, &consts));
+    try expect(fits(k5, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421), int("nt", 2288) }, &consts, .{}).? == 2);
+    try expect(fits(k6, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421), int("nt", 2288) }, &consts, .{}) == null);
+    // 145,152 (n div 16, VIS 8 bytes in): upstream's rule refuses VIS; listed in ptrs8, 5f4f fits and VIS is not held
+    try expect(fits(k5, &.{ ptr("VIS", "*i64", 0x1008), int("n", 145152), int("nt", 2268) }, &consts, .{}) == null);
+    try expect(fits(k5, &.{ ptr("VIS", "*i64", 0x1008), int("n", 145152), int("nt", 2268) }, &consts, rx).? == 1);
+    // 4-aligned never; a variant compiled for div-16 n never takes n = 146421; another constexpr never
+    try expect(fits(k5, &.{ ptr("VIS", "*i64", 0x1004), int("n", 146421), int("nt", 2289) }, &consts, rx) == null);
+    try expect(fits(k6, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421), int("nt", 1) }, &consts, rx) == null);
+    try expect(fits(k5, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421), int("nt", 2289) }, &.{ci("KEYS", 1)}, rx) == null);
 }

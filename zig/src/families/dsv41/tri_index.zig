@@ -63,8 +63,10 @@ pub const IndexK = union(enum) {
 /// index_keys' cand: the candidate pool's block mask (bool [R, >= cdiv(n, cand_block)], read as u8) and its row stride.
 pub const Cand = struct { mask: u64, stride: usize };
 
-/// index_score's fp32 scores without bases: what _index_score's variants (KEYS=0, HAS_BASE=0, PACKED=1) do not depend on.
-const score_relax: aot.Relax = .{ .ints = &.{ "n", "nt" }, .ptrs8 = &.{ "VIS", "KB", "CAND" } };
+/// index_score's fp32 scores without bases: beyond aot's fallback (n, nt div 16 onto any-value variants), VIS, KB and
+/// CAND 8-aligned onto variants that assumed 16, which _index_score's variants (KEYS=0, HAS_BASE=0, PACKED=1) do not
+/// depend on (they read VIS as one int64 a row, KB and CAND not at all).
+const score_relax: aot.Relax = .{ .ptrs8 = &.{ "VIS", "KB", "CAND" } };
 
 /// index_score: q [R, IH, ID], k, w [R, IH], vis [R] -> out [R, n] fp32 scores; `keys`: int64 keys; `tmax`: tile maxima.
 pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u64, base: ?u64, keys: bool, tmax: ?u64, rowwise: bool, rows: usize, ih: usize, id: usize) !void {
@@ -77,8 +79,9 @@ pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u6
         // HAS_CAND, CB and DEAD_PAD at the kernel's defaults (index_score passes none of them)
         // SKIP_DEAD: switch "tile_skip" (served on), a tile wholly at or past vis skips its dots
         // fp32 scores of FP4 keys without bases (prompt row blocks of at most decode_rows rows): the kit captured
-        // n and nt not divisible by 16 and vis 16-aligned only, and this code reads KB, CAND, cs, TMAX and nt not at
-        // all, n not for its divisibility, vis as one int64 a row (captured cubins' SASS: missing-variant.md)
+        // n and nt not divisible by 16 and vis 16-aligned only. aot's fallback runs a div-16 n or nt on that variant
+        // (5f4fceb20c); an odd row block puts vis 8 bytes in, which upstream's fallback refuses, but this code reads
+        // KB, CAND, cs, TMAX and nt not at all and vis as one int64 a row (captured cubins' SASS: missing-variant.md)
         const relax: aot.Relax = if (!keys and base == null and k == .fp4) score_relax else .{};
         return t.runRelaxed("_index_score", .{ u(rows), nt, 1 }, &.{
             p("Q", "*bf16", q),     p("K", k.ty(), k.codes()), p("KS", k.ty(), k.scales()), p("Wt", "*bf16", w),

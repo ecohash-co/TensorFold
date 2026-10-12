@@ -24,6 +24,7 @@ the family uses and what it took from each. The branch changes these upstream fi
   zig/src/core/lane_host_test.zig
   zig/src/core/lanes/fake.zig
   zig/src/core/lanes/stream.zig
+  zig/src/cuda/aot.zig
   zig/src/cuda/driver.zig
   zig/src/cuda/kernels.zig
   zig/src/cuda/launch.zig

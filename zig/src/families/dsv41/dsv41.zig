@@ -44,6 +44,7 @@ pub const prompt2d = @import("prompt2d.zig");
 pub const ovl = @import("ovl.zig");
 pub const attn = @import("attn.zig");
 pub const router = @import("router.zig");
+pub const p16 = @import("p16.zig");
 pub const ring2d = @import("ring2d.zig");
 pub const text = @import("text.zig");
 pub const round = @import("round.zig");
@@ -98,6 +99,7 @@ test {
     refAll(ovl);
     refAll(attn);
     refAll(router);
+    refAll(p16);
     refAll(ring2d);
     refAll(text);
     refAll(round);

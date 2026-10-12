@@ -34,6 +34,7 @@ const pprof_mod = @import("pprof.zig");
 const ovl = @import("ovl.zig");
 const attn = @import("attn.zig");
 const router = @import("router.zig");
+const p16 = @import("p16.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -329,6 +330,7 @@ pub const Model = struct {
     attn_k: ?attn.Kernels = null, // its tsel kernel (attn_prompt.cu)
     router_st: router.State = .{}, // TF_DS_PROMPT_ROUTER: its levers, kernels and calibrated split-K (promptRouter)
     router_k: ?router.Kernels = null, // router_own.cu
+    p16_k: ?p16.Kernels = null, // TF_DS_PROMPT_P16=1: p16.cu (the SP chunks' owner exchange as bf16)
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
@@ -389,6 +391,9 @@ pub const Model = struct {
         if (attn_lv.sp() and sp.pair == null) return error.AttnNeedsTheFourNodeSplit;
         if (attn_lv.any() and promptOverlap()) return error.AttnWithOverlap;
         const router_lv = try promptRouter(); // (likewise)
+        // TF_DS_PROMPT_P16 (tier 2, p16.zig; likewise): a bad value, or 1 without the four-node split and SP rows, refuses
+        const p16_on = try p16.fromEnv();
+        try p16.check(p16_on, sp.pair != null, m.sp_rows);
         if (router_lv.any()) {
             if (sp.pair == null) return error.RouterNeedsTheFourNodeSplit;
             if (promptOverlap()) return error.RouterWithOverlap;
@@ -486,12 +491,19 @@ pub const Model = struct {
         // world 4 (layer_main's setup): the 2D exchanges' buffers, and with rdma_devices their rings (whose infos go
         // round over NCCL world 4)
         errdefer if (m.rdma_rings) |*x| x.close(gpa);
+        errdefer if (m.p16_k) |*x| x.unload();
         if (sp.pair != null) {
             m.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, m.pass_rows);
             m.two.?.p2p_cat = m.sp_rows;
             // TF_DS_PROMPT_ENGRAM / TF_DS_PROMPT_A2A: only SP chunks take them (nothing changes without SP rows)
             m.two.?.engram_sp = try promptEngram();
             m.two.?.a2a_shift = try promptA2a();
+            if (p16_on) {
+                if (!cuda.kernels.available) return error.NoKernelImages;
+                m.p16_k = try p16.Kernels.load(d, cuda.kernels.dsv41_p16);
+                try m.two.?.useP16(&m.arena, &m.p16_k.?, m.pass_rows);
+                std.log.info(p16.start_line, .{});
+            }
             if (m.two.?.engram_sp) std.log.info("TF_DS_PROMPT_ENGRAM=sp: Engram sums on owned rows ({s})", .{if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset"});
             if (m.two.?.a2a_shift) std.log.info("TF_DS_PROMPT_A2A=shift: toOwners in three shift steps ({s})", .{if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset"});
             if (ovl_lv.any()) {
@@ -606,6 +618,7 @@ pub const Model = struct {
             ov.two.p2p_cat = m.sp_rows;
             ov.two.engram_sp = m.two.?.engram_sp;
             ov.two.a2a_shift = m.two.?.a2a_shift;
+            if (m.p16_k) |*k| try ov.two.useP16(&m.arena, k, chunk_rows);
             ov.eng = m.eng;
             ov.eng.s = ov.stream;
             ov.eng.t.stream = ov.stream;
@@ -729,6 +742,7 @@ pub const Model = struct {
         m.attn_k = null;
         m.router_st = .{};
         m.router_k = null;
+        m.p16_k = null;
         m.x2 = null;
         m.img_buf = null;
     }
@@ -789,6 +803,7 @@ pub const Model = struct {
         if (m.x2) |*x| x.unload();
         if (m.attn_k) |*x| x.unload();
         if (m.router_k) |*x| x.unload();
+        if (m.p16_k) |*x| x.unload();
         m.ex.unload();
         m.ops.unload();
         m.exk.unload();

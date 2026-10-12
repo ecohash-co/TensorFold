@@ -34,6 +34,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_exl3_prompt", .src = "dsv41/exl3_prompt", .flags = &.{ "-O3", "-lineinfo" } }, // ours: TF_DS_EXL3_PROMPT=v2's gate / up (input rotation in the program) and down prompt GEMMs, the served arithmetic (tensorfold_exl3_experts_v19's flags)
     .{ .name = "dsv41_attn", .src = "dsv41/attn_prompt", .flags = &.{ "-O3", "-lineinfo" } }, // ours: TF_DS_PROMPT_ATTN=tsel's one-launch top-k of the prompt indexer (attn.zig)
     .{ .name = "dsv41_router", .src = "dsv41/router_own", .flags = &.{ "-O3", "--fmad=false", "-lineinfo" } }, // ours: TF_DS_PROMPT_ROUTER=own's gate logits of the own rows with today's cuBLAS run's split-K arithmetic (router.zig)
+    .{ .name = "dsv41_p16", .src = "dsv41/p16", .flags = &.{ "-O3", "-lineinfo" } }, // ours: TF_DS_PROMPT_P16=1: the bf16 pack / widen of the SP chunks' owner exchange (p16.zig; integer arithmetic, no float flags matter)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

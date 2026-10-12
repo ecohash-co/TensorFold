@@ -27,6 +27,7 @@ const round_rows = @import("round.zig").max_rows;
 const Link = @import("link.zig").Link;
 const Comm = @import("comm.zig").Comm;
 const ovl = @import("ovl.zig");
+const p16 = @import("p16.zig");
 
 const nccl = cuda.nccl;
 
@@ -127,6 +128,11 @@ pub const Two = struct {
     // TF_DS_PROMPT_A2A=shift (model.promptA2a): toOwners as three shift steps (send to g + k, receive from g - k), so
     // no node receives from two peers at once; the same transfers
     a2a_shift: bool = false,
+    // TF_DS_PROMPT_P16=1 (p16.zig, useP16; tier 2): toOwners' transfers as bf16, packed into p16_stage (bf16 [cap,
+    // widest part], the rows sent) and widened back to fp32 by the copies. null: off, every exchange as served
+    p16k: ?*const p16.Kernels = null,
+    p16_stage: u64 = 0,
+    p16_bytes: usize = 0,
 
     /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
@@ -178,7 +184,18 @@ pub const Two = struct {
         t.p2p_cat = false;
         t.engram_sp = false;
         t.a2a_shift = false;
+        t.p16k = null;
+        t.p16_stage = 0;
+        t.p16_bytes = 0;
         return t;
+    }
+
+    /// TF_DS_PROMPT_P16=1: toOwners' transfers as bf16 from here on (the staging copy for chunks of up to `cap` rows
+    /// from `a`). Only Model.open calls it, after init, when the switch is on: off, nothing is taken from the arena.
+    pub fn useP16(t: *Two, a: *prompt.Arena, k: *const p16.Kernels, cap: usize) !void {
+        t.p16_bytes = cap * @max(t.ow[0], t.ow[1]) * 2;
+        t.p16_stage = try a.take(t.p16_bytes);
+        t.p16k = k;
     }
 
     fn restScratch(a: *prompt.Arena, ex: weights.Experts, rows: usize, slots: usize, chunk: bool) !exl3_experts2d.RestScratch {
@@ -303,7 +320,34 @@ pub const Two = struct {
     /// toOwners' transfers (its NCCL part) on stream `s`: every other owner's rows of `src` to it, this node's rows of
     /// theirs into `parts`. This node's own rows of `src` are not read (TF_DS_PROMPT_OVL=wob computes them meanwhile).
     pub fn toOwnersSend(t: *const Two, e: *const prompt.Engine, s: cuda.Stream, src: u64, o: Owners, w: [2]usize, esize: usize) !void {
+        if (t.p16k) |k| {
+            // TF_DS_PROMPT_P16=1: the rows sent rounded to bf16 on stream s (reading no row of this node's), sent as
+            // bf16 into parts at the bf16 offsets
+            try t.p16Pack(k, s, src, t.p16_stage, o, w, esize);
+            return t.toOwnersSendAt(e, s, t.p16_stage, t.parts, o, w, 2);
+        }
         return t.toOwnersSendAt(e, s, src, t.parts, o, w, esize);
+    }
+
+    /// TF_DS_PROMPT_P16=1: every other owner's rows of the fp32 part `src` [o.n, w[p]] rounded into `stage` (bf16, the
+    /// same rows at the same row index), on stream s; this node's own rows are not read.
+    fn p16Pack(t: *const Two, k: *const p16.Kernels, s: cuda.Stream, src: u64, stage: u64, o: Owners, w: [2]usize, esize: usize) !void {
+        if (esize != 4) return error.P16NotFp32;
+        if (!o.valid()) return error.BadOwnerRows;
+        const wp = w[t.p];
+        if (stage + o.n * wp * 2 > t.p16_stage + t.p16_bytes) return error.PartTooBig;
+        for (p16.packPlan(t.r + 2 * t.p, o, wp)) |pk| try k.pack(s, src + pk.src_off, stage + pk.dst_off, pk.count);
+    }
+
+    /// TF_DS_PROMPT_P16=1: toOwnersCopy's placement from bf16 parts: this node's own rows copied from `src` (fp32) as
+    /// today, every other node's widened from `parts` (bf16 at c2's offsets) into the fp32 places c4 gives.
+    fn p16Copy(t: *const Two, k: *const p16.Kernels, e: *const prompt.Engine, src: u64, parts: u64, dst: u64, rows: usize, c4: [4]OwnerCopy, c2: [4]OwnerCopy) !void {
+        const me = t.r + 2 * t.p;
+        for (c4, c2) |x, y| {
+            if (x.from == me) {
+                try e.ops.copyRows(e.s, src + x.src_off, x.src_ld, dst + x.dst_off, x.dst_ld, x.bytes, rows);
+            } else try k.widenRows(e.s, parts + y.src_off, y.src_ld, dst + x.dst_off, x.dst_ld, x.bytes / 4, rows);
+        }
     }
 
     /// toOwnersSend with this node's rows of the others' parts landing at `parts` (t.parts, or a half's area of it).
@@ -341,6 +385,10 @@ pub const Two = struct {
     /// toOwners' copies into dst (on the compute stream, after the transfers).
     pub fn toOwnersCopy(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, o: Owners, w: [2]usize, esize: usize) !void {
         const me = t.r + 2 * t.p;
+        if (t.p16k) |k| {
+            if (esize != 4) return error.P16NotFp32;
+            return t.p16Copy(k, e, src, t.parts, dst, o.rows(me), ownerCopies(me, o, w, 4), ownerCopies(me, o, w, 2));
+        }
         for (ownerCopies(me, o, w, esize)) |cp| {
             const base = if (cp.from == me) src else t.parts;
             try e.ops.copyRows(e.s, base + cp.src_off, cp.src_ld, dst + cp.dst_off, cp.dst_ld, cp.bytes, o.rows(me));
@@ -353,6 +401,13 @@ pub const Two = struct {
     pub fn toOwnersSendHalf(t: *const Two, e: *const prompt.Engine, s: cuda.Stream, src: u64, o: Owners, w: [2]usize, esize: usize, h: usize) !void {
         const wh = try halves(w);
         if (dnPartsOff(o, w, esize, 2) > 4 * t.part_bytes) return error.PartTooBig;
+        if (t.p16k) |k| {
+            // TF_DS_PROMPT_P16=1: half h's sent rows rounded into half h's area of the stage (half-major as src), sent
+            // as bf16 into half h's bf16 area of parts
+            const at = t.p16_stage + h * o.n * wh[t.p] * 2;
+            try t.p16Pack(k, s, src + h * o.n * wh[t.p] * esize, at, o, wh, esize);
+            return t.toOwnersSendAt(e, s, at, t.parts + dnPartsOff(o, w, 2, h), o, wh, 2);
+        }
         return t.toOwnersSendAt(e, s, src + h * o.n * wh[t.p] * esize, t.parts + dnPartsOff(o, w, esize, h), o, wh, esize);
     }
 
@@ -361,6 +416,11 @@ pub const Two = struct {
     pub fn toOwnersCopyHalves(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, o: Owners, w: [2]usize, esize: usize) !void {
         const me = t.r + 2 * t.p;
         const wh = try halves(w);
+        if (t.p16k) |k| {
+            if (esize != 4) return error.P16NotFp32;
+            for (0..2) |h| try t.p16Copy(k, e, src + h * o.n * wh[t.p] * 4, t.parts + dnPartsOff(o, w, 2, h), dst, o.rows(me), ownerCopiesHalf(me, o, w, 4, h), ownerCopiesHalf(me, o, w, 2, h));
+            return;
+        }
         for (0..2) |h| for (ownerCopiesHalf(me, o, w, esize, h)) |cp| {
             const base = if (cp.from == me) src + h * o.n * wh[t.p] * esize else t.parts + dnPartsOff(o, w, esize, h);
             try e.ops.copyRows(e.s, base + cp.src_off, cp.src_ld, dst + cp.dst_off, cp.dst_ld, cp.bytes, o.rows(me));

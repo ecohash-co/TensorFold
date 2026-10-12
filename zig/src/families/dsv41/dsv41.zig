@@ -59,6 +59,7 @@ pub const refusal = @import("refusal.zig");
 pub const aot_ptr8 = @import("aot_ptr8.zig");
 pub const ptr8_check = @import("ptr8_check.zig");
 pub const mx_prompt = @import("mx_prompt.zig");
+pub const mx_ref = @import("mx_ref.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -115,4 +116,5 @@ test {
     refAll(aot_ptr8);
     refAll(ptr8_check);
     refAll(mx_prompt);
+    refAll(mx_ref);
 }

@@ -143,6 +143,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_exl3.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_exl3.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-exl3-bench", .root_module = ds_exl3 }));
+    // stage MX3: the MXFP4 prompt experts (mx_prompt.zig) on one GPU with a node's real slices: timed, checked against
+    // float64 from the original checkpoint, and bit for bit against the Python bench's dumps
+    const ds_mx = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/mx_bench_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_mx.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    ds_mx.addImport("cuda", cuda);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-mx-bench", .root_module = ds_mx }));
     // TF_DS_PROMPT_ATTN (stage ZT1): a 2D node's prompt-chunk attention layer after layer on one GPU with its real
     // weights and caches made by the real compressor, timed by layer and phase, and the levers' outputs compared byte
     // for byte with today's launches

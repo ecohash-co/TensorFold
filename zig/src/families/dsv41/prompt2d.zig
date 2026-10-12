@@ -28,6 +28,7 @@ const Link = @import("link.zig").Link;
 const Comm = @import("comm.zig").Comm;
 const ovl = @import("ovl.zig");
 const p16 = @import("p16.zig");
+const mx_prompt = @import("mx_prompt.zig");
 
 const nccl = cuda.nccl;
 
@@ -68,18 +69,49 @@ pub const Fan = struct {
 
     /// Comm.init over every link: rank 0 makes the id and sends it to each follower. Needs the CUDA context current.
     pub fn comm(f: *const Fan, rank: u32, world: u32) !Comm {
+        return f.commMx(rank, world, 0);
+    }
+
+    /// comm, with TF_DS_PREFILL_MXFP4_LAYERS' cross-rank check riding on the id's frames (mx_prompt.trailer): `mx` 0
+    /// sends and accepts exactly today's frames; otherwise rank 0 appends its n to each id and waits for each
+    /// follower's acknowledgement, and a follower whose n differs from rank 0's (0 without a trailer) refuses.
+    pub fn commMx(f: *const Fan, rank: u32, world: u32, mx: u32) !Comm {
         var lib = try nccl.Library.open();
         errdefer lib.close();
         var id: nccl.UniqueId = undefined;
+        const id_len = @sizeOf(nccl.UniqueId);
         if (world > 1) {
             if (rank == 0) {
                 try lib.check(lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId");
-                for (f.links) |l| if (l) |x| try x.send(std.mem.asBytes(&id));
+                if (mx == 0) {
+                    for (f.links) |l| if (l) |x| try x.send(std.mem.asBytes(&id));
+                } else {
+                    var frame: [id_len + 8]u8 = undefined;
+                    @memcpy(frame[0..id_len], std.mem.asBytes(&id));
+                    @memcpy(frame[id_len..], &mx_prompt.trailer(mx));
+                    for (f.links) |l| if (l) |x| try x.send(&frame);
+                    for (f.links, 1..) |l, g| if (l) |x| {
+                        var ack: [8]u8 = undefined;
+                        const got = x.recv(&ack) catch |err| {
+                            std.log.err("TF_DS_PREFILL_MXFP4_LAYERS={d}: rank {d} did not acknowledge it ({s}): every rank must run the same n", .{ mx, g, @errorName(err) });
+                            return error.MxLayersDisagree;
+                        };
+                        if (mx_prompt.trailerOf(got, 0) != mx) {
+                            std.log.err("TF_DS_PREFILL_MXFP4_LAYERS={d}: rank {d} answered otherwise: every rank must run the same n", .{ mx, g });
+                            return error.MxLayersDisagree;
+                        }
+                    };
+                }
             } else {
-                var buf: [@sizeOf(nccl.UniqueId)]u8 = undefined;
+                var buf: [id_len + 8]u8 = undefined;
                 const got = try f.links[0].?.recv(&buf);
-                if (got.len != buf.len) return error.BadUniqueId;
-                id = std.mem.bytesToValue(nccl.UniqueId, got);
+                const theirs = mx_prompt.trailerOf(got, id_len) orelse return error.BadUniqueId;
+                if (theirs != mx) {
+                    std.log.err("TF_DS_PREFILL_MXFP4_LAYERS: rank 0 runs {d}, this rank {d}: every rank must run the same n", .{ theirs, mx });
+                    return error.MxLayersDisagree;
+                }
+                id = std.mem.bytesToValue(nccl.UniqueId, got[0..id_len]);
+                if (mx != 0) try f.links[0].?.send(&mx_prompt.trailer(mx));
             }
         } else try lib.check(lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId");
         var c: nccl.Comm = null;
@@ -133,6 +165,9 @@ pub const Two = struct {
     p16k: ?*const p16.Kernels = null,
     p16_stage: u64 = 0,
     p16_bytes: usize = 0,
+    // TF_DS_PREFILL_MXFP4_LAYERS (mx_prompt.zig; tier 2): the MXFP4 layers' kernels, slices and scratch; null: off,
+    // every layer as served
+    mx: ?*const mx_prompt.State = null,
 
     /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
@@ -187,6 +222,7 @@ pub const Two = struct {
         t.p16k = null;
         t.p16_stage = 0;
         t.p16_bytes = 0;
+        t.mx = null;
         return t;
     }
 
@@ -469,6 +505,8 @@ pub const Two = struct {
     /// for this node's output columns: ch.pm [n, dw[p]] fp32. A chunk of fewer than EXACT_ROWS rows takes the decode
     /// window's fused path and scratch (experts2d.fused_ok), as the rounds do.
     pub fn experts(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
+        // TF_DS_PREFILL_MXFP4_LAYERS: this layer's prompt chunks (any row count) on the MXFP4 experts
+        if (t.mx) |mx| if (mx.has(lay.idx)) return t.expertsMx(e, ch, lay, mx);
         const c = e.c;
         const n = ch.n;
         if (n < exl3_experts.exact_rows) {
@@ -501,6 +539,72 @@ pub const Two = struct {
             try t.downV2(e, ch, lay, x2);
         } else try exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
         try prompt.pm(e, .moe);
+    }
+
+    /// TF_DS_PREFILL_MXFP4_LAYERS (mx_prompt.zig): the layer's experts on its MXFP4 slice, for every prompt chunk (fewer
+    /// than EXACT_ROWS rows too). Gate / up into the pack (ch.xs.xd: bf16 main rows [P, ig], then rest rows [P, ir], the
+    /// EXL3 pack's bytes a row), the pack exchanged and assembled as today (assembleParity, the same owner table:
+    /// plan.restPair), down of the routed pairs and the shared slot into y (ch.xs.z), the slot combine into ch.pm.
+    /// OVL on an SP chunk: pack and pack3 run as pack (the main rows sent while the rest block runs; pack3's half split
+    /// is EXL3's), dn and dnc as dnc (the other owners' rows combined and sent while this node's rows combine); the
+    /// same bytes as without them (every element is computed the same way; only launch order and streams move).
+    fn expertsMx(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer, mx: *const mx_prompt.State) !void {
+        const c = e.c;
+        const n = ch.n;
+        const ml = &mx.layers[lay.idx];
+        const sc = mx.sc;
+        const rows = n * ch.xs.slots;
+        if (n > sc.rows or ch.xs.slots != sc.slots) return error.MxScratchTooSmall;
+        if (t.ir != 0) if (t.packSide(e, ch)) |sd| {
+            try t.packOvlMx(e, ch, lay, ml, mx, sd);
+        } else {
+            try mx_prompt.gateUp(mx.k, e.ops, e.blas, e.s, ml, sc, ch.x, c.hidden, ch.pick, n, ch.xs.xd, c.swiglu_limit, mx.geos);
+            try prompt.pm(e, .moe);
+            try t.assembleParity(e, lay.experts, ch.xs.xd, ch.pick, rows);
+        } else return error.MxNeedsTheParitySplit;
+        defer prompt.pm(e, .moe) catch {};
+        try mx_prompt.downGemms(mx.k, e.blas, e.s, ml, sc, t.xd_full, n, ch.xs.z, mx.geos.down);
+        if (e.side) |sd| if (sd.lv.dn or sd.lv.dnc) if (ch.sp) |sp| if (ovl.othersFirst(sp.owners(), sp.g)) |rp| {
+            // dn / dnc as dnc: the other owners' rows first, their transfers on the comm stream, this node's rows under them
+            for (rp[0..2]) |r| try mx_prompt.combineRows(mx.k, e.s, ml, ch.xs.z, ch.wts, ch.pm, ch.xs.slots, r.r0, r.rows);
+            try sd.fork(e.s);
+            try t.toOwnersSend(e, sd.stream, ch.pm, sp.owners(), t.dw, 4);
+            try sd.end(.dn);
+            try mx_prompt.combineRows(mx.k, e.s, ml, ch.xs.z, ch.wts, ch.pm, ch.xs.slots, rp[2].r0, rp[2].rows);
+            ch.pm_sent = .whole;
+            return;
+        };
+        try mx_prompt.combine(mx.k, e.s, ch.xs.z, ch.wts, ch.pm, ml.x.downN(), n, ch.xs.slots, ml.x.downN());
+    }
+
+    /// TF_DS_PROMPT_OVL=pack / pack3 on an MXFP4 layer: the plans, the main columns and the shared expert (its main rows
+    /// and, on pair 1, its rest rows), the main rows to the column partner on the comm stream while the rest block runs,
+    /// then the rest rows; assemble waits for both (packExchange's bytes from and into the same offsets).
+    fn packOvlMx(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer, ml: *const mx_prompt.Layer, mx: *const mx_prompt.State, sd: *ovl.Side) !void {
+        const c = e.c;
+        const n = ch.n;
+        const rows = n * ch.xs.slots;
+        const ig = t.gu[t.p];
+        const g: u32 = @intCast(t.r + 2 * t.p);
+        const xd = ch.xs.xd;
+        const sc = mx.sc;
+        try mx_prompt.plan(mx.k, e.ops, e.s, ml, sc, ch.pick, n);
+        try mx_prompt.gateMain(mx.k, e.s, ml, sc, ch.x, c.hidden, n, xd, c.swiglu_limit, mx.geos.main);
+        try mx_prompt.sharedGateUp(mx.k, e.blas, e.s, ml, sc, ch.x, c.hidden, n, xd, c.swiglu_limit);
+        try prompt.pm(e, .moe);
+        try sd.fork(e.s);
+        try e.comm.exchange(xd, rows * ig, t.peer, rows * ig, .f16, g ^ 2, sd.stream);
+        try mx_prompt.gateRest(mx.k, e.s, ml, sc, ch.x, c.hidden, n, xd, c.swiglu_limit, mx.geos.rest);
+        try prompt.pm(e, .moe);
+        try sd.fork(e.s);
+        try e.comm.exchange(xd + rows * ig * 2, rows * t.ir, t.peer + rows * ig * 2, rows * t.ir, .f16, g ^ 2, sd.stream);
+        try sd.end(.pack);
+        try sd.join(e.s, .pack);
+        try prompt.pm(e, .comm);
+        const rest = lay.experts.rest orelse return error.NoRest;
+        const part0 = if (t.p == 0) xd else t.peer;
+        const part1 = if (t.p == 1) xd else t.peer;
+        try e.ops.assembleRest(e.s, part0, part1, ch.pick, rest.owner, t.xd_full, rows, ig, t.ir);
     }
 
     /// The comm stream when TF_DS_PROMPT_OVL=pack acts on this chunk: an SP chunk (Engine.side is set for those alone)

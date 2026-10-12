@@ -1,4 +1,4 @@
-//! Stage MX3 (milestone 1: kernels, slice loader and tf-dsv41-mx-bench; no layer calls this yet): a 2D node's prompt-chunk
+//! Stage MX3 (TF_DS_PREFILL_MXFP4_LAYERS, tier 2: a deliberate numerics change, off by default): a 2D node's prompt-chunk
 //! experts on the original MXFP4 weights (TIER-2 lever "MXFP4 prefill copy of the encoder experts", stageMX0/README.md)
 //! in place of the EXL3 chain, for layers that hold a converted slice (convert_mxfp4_slices.py, one safetensors file a
 //! (layer, node)): TensorFold's O2 prefill kernel (zig/kernels/cuda/dsv41/mx_prompt.cu, upstream's template as it is)
@@ -130,6 +130,98 @@ pub const Kernels = struct {
         k.* = undefined;
     }
 };
+
+// -- the knobs (Model.open) -------------------------------------------------------------------------------------------
+
+pub const start_line = "TF_DS_PREFILL_MXFP4_LAYERS={d}: prompt chunks of layers 0-{d} on the MXFP4 experts ({d:.1} GiB of slices from {s}; tier 2, numerics change)";
+
+/// TF_DS_PREFILL_MXFP4_LAYERS's value: null, "" or "0": off (0); 1..max: layers [0, n) (max = the encoder layers, 20);
+/// anything else error.BadPrefillMxfp4.
+pub fn parseLayers(v: ?[]const u8, max: usize) !u32 {
+    const s = v orelse return 0;
+    if (s.len == 0) return 0;
+    const n = std.fmt.parseInt(u32, s, 10) catch return error.BadPrefillMxfp4;
+    if (n > max) return error.BadPrefillMxfp4;
+    return n;
+}
+
+pub fn layersFromEnv(max: usize) !u32 {
+    const v = std.c.getenv("TF_DS_PREFILL_MXFP4_LAYERS") orelse return 0;
+    return parseLayers(std.mem.span(v), max);
+}
+
+/// TF_DS_MXFP4_DIR: where the slices are inside the lane's container. Default /cache/mxfp4-slices: the recipe's
+/// node_run.sh mounts CACHE_DIR at /cache (and nothing else that holds them), so each node's slices are hard links in
+/// CACHE_DIR/mxfp4-slices (stageMX3 prep_mx16.sh) -- no recipe change, no copy.
+pub const default_dir = "/cache/mxfp4-slices";
+
+pub fn dirFromEnv() []const u8 {
+    const v = std.c.getenv("TF_DS_MXFP4_DIR") orelse return default_dir;
+    const s = std.mem.span(v);
+    return if (s.len == 0) default_dir else s;
+}
+
+/// TF_DS_MXFP4_MIN_AVAIL_GIB (default 4): the start refuses when /proc/meminfo's MemAvailable after the slices' load is
+/// below it (GB10: device memory is the host's).
+pub fn parseMinAvail(v: ?[]const u8) !f64 {
+    const s = v orelse return 4;
+    if (s.len == 0) return 4;
+    const x = std.fmt.parseFloat(f64, s) catch return error.BadMxfp4MinAvail;
+    if (!(x >= 0) or !std.math.isFinite(x)) return error.BadMxfp4MinAvail;
+    return x;
+}
+
+pub fn minAvailFromEnv() !f64 {
+    const v = std.c.getenv("TF_DS_MXFP4_MIN_AVAIL_GIB") orelse return parseMinAvail(null);
+    return parseMinAvail(std.mem.span(v));
+}
+
+/// MemAvailable now, GiB (null: unreadable).
+pub fn memAvailableGiB(a: std.mem.Allocator, io: std.Io) ?f64 {
+    var file = std.Io.Dir.cwd().openFile(io, "/proc/meminfo", .{}) catch return null;
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var r = file.readerStreaming(io, &buf);
+    const text = r.interface.allocRemaining(a, .limited(1 << 20)) catch return null;
+    defer a.free(text);
+    const v = memAvailable(text) orelse return null;
+    return @as(f64, @floatFromInt(v)) / (1 << 30);
+}
+
+/// What a node's prompt chunks read on the MXFP4 layers (Model.open builds it; prompt2d.Two.mx points here): the
+/// kernels, layers [0, layers.len)'s slices, the chunk scratch (from the prompt arena) and the geometries.
+pub const State = struct {
+    k: *const Kernels,
+    layers: []const Layer,
+    sc: Scratch,
+    geos: Geos = .{},
+
+    /// Whether layer `li`'s prompt chunks take the MXFP4 path.
+    pub fn has(st: *const State, li: usize) bool {
+        return li < st.layers.len;
+    }
+};
+
+/// The cross-rank check of the knob (prompt2d.Fan.commMx): rank 0 appends this trailer to the NCCL unique id it sends
+/// each follower when its n is not 0 (with n 0 the frame is the id alone, as today); a follower refuses unless rank 0's
+/// n (0 without a trailer) equals its own, and acknowledges with the same trailer when it is not 0, which rank 0 waits
+/// for. So a mismatch never reaches the first collective: the follower that disagrees ends loudly, and rank 0 (when its
+/// n is not 0) ends on the missing acknowledgement.
+pub const trailer_magic = "MXF4";
+
+pub fn trailer(n: u32) [8]u8 {
+    var t: [8]u8 = undefined;
+    @memcpy(t[0..4], trailer_magic);
+    std.mem.writeInt(u32, t[4..8], n, .little);
+    return t;
+}
+
+/// The n a frame after `id_len` id bytes carries: 0 for the id alone, the trailer's n, or null for anything else.
+pub fn trailerOf(frame: []const u8, id_len: usize) ?u32 {
+    if (frame.len == id_len) return 0;
+    if (frame.len != id_len + 8 or !std.mem.eql(u8, frame[id_len..][0..4], trailer_magic)) return null;
+    return std.mem.readInt(u32, frame[id_len + 4 ..][0..4], .little);
+}
 
 // -- the grouping ---------------------------------------------------------------------------------------------------
 
@@ -695,6 +787,19 @@ pub fn combine(k: *const Kernels, s: cuda.Stream, y: u64, wts: u64, out: u64, ou
     try go(k.combine, s, cdiv(n4, 256), 256, 0, &a);
 }
 
+/// combine of rows [r0, r0 + rows) of a chunk (each row reads only its own slots: the same bytes as a whole-chunk combine).
+pub fn combineRows(k: *const Kernels, s: cuda.Stream, lay: *const Layer, y: u64, wts: u64, out: u64, slots: usize, r0: usize, rows: usize) !void {
+    if (rows == 0) return;
+    const dn = lay.x.downN();
+    try combine(k, s, y + r0 * slots * dn * 4, wts + r0 * slots * 4, out + r0 * dn * 4, dn, rows, slots, dn);
+}
+
+/// Down of the routed pairs and of the shared slot into y (no combine).
+pub fn downGemms(k: *const Kernels, blas: *const cublas.Blas, s: cuda.Stream, lay: *const Layer, sc: Scratch, xd_full: u64, n: usize, y: u64, geo: u32) !void {
+    try downRouted(k, s, lay, sc, xd_full, n, y, geo);
+    try sharedDown(blas, lay, xd_full, n, sc.slots, y);
+}
+
 /// Everything after the exchange: down of the routed pairs and the shared slot into y, then the combine into out.
 pub fn down(k: *const Kernels, blas: *const cublas.Blas, s: cuda.Stream, lay: *const Layer, sc: Scratch, xd_full: u64, wts: u64, n: usize, y: u64, out: u64, geo: u32) !void {
     try downRouted(k, s, lay, sc, xd_full, n, y, geo);
@@ -831,4 +936,27 @@ test "entry shapes, symbols and grids" {
 test "MemAvailable from /proc/meminfo's text" {
     try testing.expectEqual(@as(?u64, 41 * 1024 * 1024 * 1024), memAvailable("MemTotal:       128000000 kB\nMemFree:  1 kB\nMemAvailable:   42991616 kB\n"));
     try testing.expectEqual(@as(?u64, null), memAvailable("MemTotal: 1 kB\n"));
+}
+
+test "TF_DS_PREFILL_MXFP4_LAYERS, TF_DS_MXFP4_MIN_AVAIL_GIB and the cross-rank trailer" {
+    try testing.expectEqual(@as(u32, 0), try parseLayers(null, 20));
+    try testing.expectEqual(@as(u32, 0), try parseLayers("", 20));
+    try testing.expectEqual(@as(u32, 0), try parseLayers("0", 20));
+    try testing.expectEqual(@as(u32, 16), try parseLayers("16", 20));
+    try testing.expectEqual(@as(u32, 20), try parseLayers("20", 20));
+    for ([_][]const u8{ "21", "-1", "x", "16 ", "1.5" }) |v| try testing.expectError(error.BadPrefillMxfp4, parseLayers(v, 20));
+    try testing.expectEqual(@as(f64, 4), try parseMinAvail(null));
+    try testing.expectEqual(@as(f64, 2.5), try parseMinAvail("2.5"));
+    try testing.expectError(error.BadMxfp4MinAvail, parseMinAvail("-1"));
+    try testing.expectError(error.BadMxfp4MinAvail, parseMinAvail("nan"));
+    // (the test process's environment does not set them)
+    if (std.c.getenv("TF_DS_PREFILL_MXFP4_LAYERS") == null) try testing.expectEqual(@as(u32, 0), try layersFromEnv(20));
+    if (std.c.getenv("TF_DS_MXFP4_DIR") == null) try testing.expectEqualStrings(default_dir, dirFromEnv());
+    var frame: [136]u8 = @splat(7);
+    try testing.expectEqual(@as(?u32, 0), trailerOf(frame[0..128], 128));
+    @memcpy(frame[128..], &trailer(16));
+    try testing.expectEqual(@as(?u32, 16), trailerOf(&frame, 128));
+    frame[128] = 'X';
+    try testing.expectEqual(@as(?u32, null), trailerOf(&frame, 128));
+    try testing.expectEqual(@as(?u32, null), trailerOf(frame[0..130], 128));
 }

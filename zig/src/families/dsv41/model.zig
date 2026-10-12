@@ -35,6 +35,7 @@ const ovl = @import("ovl.zig");
 const attn = @import("attn.zig");
 const router = @import("router.zig");
 const p16 = @import("p16.zig");
+const mx_prompt = @import("mx_prompt.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -331,6 +332,11 @@ pub const Model = struct {
     router_st: router.State = .{}, // TF_DS_PROMPT_ROUTER: its levers, kernels and calibrated split-K (promptRouter)
     router_k: ?router.Kernels = null, // router_own.cu
     p16_k: ?p16.Kernels = null, // TF_DS_PROMPT_P16=1: p16.cu (the SP chunks' owner exchange as bf16)
+    // TF_DS_PREFILL_MXFP4_LAYERS=n (mx_prompt.zig; tier 2): mx_prompt.cu, layers [0, n)'s MXFP4 slices and the state
+    // prompt2d.Two.mx points at (null / empty: off, nothing loaded or taken)
+    mx_k: ?mx_prompt.Kernels = null,
+    mx_layers: []mx_prompt.Layer = &.{},
+    mx_st: mx_prompt.State = undefined,
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
@@ -394,6 +400,15 @@ pub const Model = struct {
         // TF_DS_PROMPT_P16 (tier 2, p16.zig; likewise): a bad value, or 1 without the four-node split and SP rows, refuses
         const p16_on = try p16.fromEnv();
         try p16.check(p16_on, sp.pair != null, m.sp_rows);
+        // TF_DS_PREFILL_MXFP4_LAYERS (tier 2, mx_prompt.zig; likewise): n of the encoder layers' prompt chunks on MXFP4
+        // slices; the four-node parity split, not the overlapped passes (their second chunk's Two has no MXFP4 state)
+        const mx_n = try mx_prompt.layersFromEnv(c.layers / 2);
+        const mx_min = try mx_prompt.minAvailFromEnv();
+        if (mx_n != 0) {
+            if (sp.pair == null or o.world != 4) return error.MxNeedsTheFourNodeSplit;
+            if (!sp.parity) return error.MxNeedsTheParitySplit;
+            if (promptOverlap()) return error.MxWithOverlap;
+        }
         if (router_lv.any()) {
             if (sp.pair == null) return error.RouterNeedsTheFourNodeSplit;
             if (promptOverlap()) return error.RouterWithOverlap;
@@ -421,7 +436,7 @@ pub const Model = struct {
         // the ranks' link and NCCL (rank 0 listens: rank 1 retries its connect while rank 0 loads)
         m.fan = try prompt2d.Fan.open(io, o.master, o.port, o.rank, o.world);
         errdefer m.fan.close();
-        m.comm = try m.fan.comm(o.rank, o.world);
+        m.comm = try m.fan.commMx(o.rank, o.world, mx_n); // (mx_n 0: today's frames)
         errdefer m.comm.deinit();
         // overlapped passes: their second NCCL communicator, right after the first on every rank (the unique id goes
         // down the same links in the same order)
@@ -466,6 +481,29 @@ pub const Model = struct {
             m.x2 = try exl3_prompt.Kernels.load(d, cuda.kernels.dsv41_exl3_prompt);
         }
         errdefer if (m.x2) |*x| x.unload();
+        errdefer if (m.mx_k) |*x| x.unload();
+        errdefer m.freeMx();
+        var mx_bytes: usize = 0;
+        if (mx_n != 0) {
+            if (!cuda.kernels.available) return error.NoKernelImages;
+            m.mx_k = try mx_prompt.Kernels.load(d, cuda.kernels.dsv41_mx_prompt);
+            const dir = mx_prompt.dirFromEnv();
+            const t0 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+            m.mx_layers = try gpa.alloc(mx_prompt.Layer, mx_n);
+            var loaded: usize = 0;
+            errdefer {
+                for (m.mx_layers[0..loaded]) |*l| l.deinit(gpa);
+                gpa.free(m.mx_layers);
+                m.mx_layers = &.{};
+            }
+            for (m.mx_layers, 0..) |*l, li| {
+                l.* = try mx_prompt.loadLayer(gpa, d, dir, try mx_prompt.Expect.of(c.*, sp, @intCast(li)));
+                loaded += 1;
+                mx_bytes += l.bytes;
+            }
+            const secs = @as(f64, @floatFromInt(std.Io.Timestamp.now(io, .awake).nanoseconds - t0)) / 1e9;
+            std.log.info("TF_DS_PREFILL_MXFP4_LAYERS={d}: {d:.1} GiB of slices loaded in {d:.1} s", .{ mx_n, @as(f64, @floatFromInt(mx_bytes)) / (1 << 30), secs });
+        }
 
         // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream reaches
         const half = c.rope_dim / 2;
@@ -504,6 +542,7 @@ pub const Model = struct {
                 try m.two.?.useP16(&m.arena, &m.p16_k.?, m.pass_rows);
                 std.log.info(p16.start_line, .{});
             }
+            if (mx_n != 0) try m.useMx(c, mx_bytes);
             if (m.two.?.engram_sp) std.log.info("TF_DS_PROMPT_ENGRAM=sp: Engram sums on owned rows ({s})", .{if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset"});
             if (m.two.?.a2a_shift) std.log.info("TF_DS_PROMPT_A2A=shift: toOwners in three shift steps ({s})", .{if (m.sp_rows) "active on SP chunks" else "inactive: TF_DS_PROMPT_SP unset"});
             if (ovl_lv.any()) {
@@ -698,6 +737,12 @@ pub const Model = struct {
             p.* = try pprof_mod.Prof.init(gpa, d, o.rank);
             m.pprof = p;
         }
+        if (mx_n != 0) {
+            // TF_DS_MXFP4_MIN_AVAIL_GIB: the host memory left once everything (the slices too) is allocated
+            const avail = mx_prompt.memAvailableGiB(a, io) orelse return error.MxNoMemInfo;
+            std.log.info("TF_DS_PREFILL_MXFP4_LAYERS={d}: MemAvailable {d:.1} GiB after setup (floor {d:.1})", .{ mx_n, avail, mx_min });
+            if (avail < mx_min) return error.MxMemoryLow;
+        }
         return m;
     }
 
@@ -745,6 +790,33 @@ pub const Model = struct {
         m.p16_k = null;
         m.x2 = null;
         m.img_buf = null;
+        m.mx_k = null;
+        m.mx_layers = &.{};
+    }
+
+    /// The MXFP4 slices (TF_DS_PREFILL_MXFP4_LAYERS), when loaded.
+    fn freeMx(m: *Model) void {
+        for (m.mx_layers) |*l| l.deinit(m.gpa);
+        if (m.mx_layers.len != 0) m.gpa.free(m.mx_layers);
+        m.mx_layers = &.{};
+    }
+
+    /// TF_DS_PREFILL_MXFP4_LAYERS: the chunk scratch from the prompt arena (only when the knob is on), the slices checked
+    /// against this node's Two (the pack is ch.xs.xd at ig + ir columns, the intermediate xd_full, y fits ch.xs.z), and
+    /// the state Two.experts reads.
+    fn useMx(m: *Model, c: *const Config, bytes: usize) !void {
+        const t = &m.two.?;
+        const x = m.mx_layers[0].x;
+        if (x.mainW() != t.gu[t.p] or x.restW() != t.ir or x.halfW() != t.gu[0] + t.gu[1] + t.ir or x.downN() != t.dw[t.p]) return error.MxSliceNotThisSplit;
+        // y [P, dn] fp32 in ch.xs.z (fp32 [promptZ(D, I) * P], I the pack's width)
+        if (exl3_experts.Scratch.promptZ(c.hidden, t.gu[t.p] + t.ir) < x.downN()) return error.MxYDoesNotFitZ;
+        const slots = c.top_k + 1;
+        const sz = mx_prompt.Scratch.sizes(m.pass_rows, slots, x);
+        var ptrs: [12]u64 = undefined;
+        for (sz, &ptrs) |n, *pp| pp.* = try m.arena.take(n);
+        m.mx_st = .{ .k = &m.mx_k.?, .layers = m.mx_layers, .sc = mx_prompt.Scratch.of(m.pass_rows, slots, x, ptrs) };
+        t.mx = &m.mx_st;
+        std.log.info(mx_prompt.start_line, .{ m.mx_layers.len, m.mx_layers.len - 1, @as(f64, @floatFromInt(bytes)) / (1 << 30), mx_prompt.dirFromEnv() });
     }
 
     pub fn close(m: *Model) void {
@@ -804,6 +876,8 @@ pub const Model = struct {
         if (m.attn_k) |*x| x.unload();
         if (m.router_k) |*x| x.unload();
         if (m.p16_k) |*x| x.unload();
+        if (m.mx_k) |*x| x.unload();
+        m.freeMx();
         m.ex.unload();
         m.ops.unload();
         m.exk.unload();

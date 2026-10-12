@@ -838,6 +838,13 @@ pub const Model = struct {
         return std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ kit, "cubins", name }), a, .limited(1 << 28), .@"16", null);
     }
 
+    /// Every stream's queued work done (cuCtxSynchronize): after a refused primitive, before the ranks agree to step past
+    /// it (lanes.zig, refusal.zig). Blocks for good when this rank posted a collective another rank never will.
+    pub fn drain(m: *const Model) !void {
+        const d = m.ctx.d;
+        try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize");
+    }
+
     /// The link to the other rank (rank 0's to rank 1, rank 1's to rank 0).
     pub fn peer(m: *const Model) link.Link {
         return m.fan.links[0].?;

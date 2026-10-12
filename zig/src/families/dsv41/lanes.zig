@@ -20,6 +20,7 @@ const round = @import("round.zig");
 const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
+const refusal = @import("refusal.zig");
 const cuda = @import("cuda");
 
 const be = lanes.backend;
@@ -349,6 +350,7 @@ pub const Lanes = struct {
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
     next_snap: u64 = 1,
+    guard: ?*refusal.Guard = null, // the followers' refusal reports and links (startGuard; refusal.zig)
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -359,8 +361,29 @@ pub const Lanes = struct {
         return ln;
     }
 
+    /// Rank 0 with followers: watch their refusal reports and links (refusal.Guard), so a refusal some rank does not
+    /// share, or a follower that ends, ends this process loudly instead of leaving the ranks waiting on each other.
+    pub fn startGuard(self: *Lanes) !void {
+        if (self.peer == null or self.guard != null) return;
+        self.guard = try refusal.Guard.start(self.gpa, self.m.followers(), refusal.waitNs(), refusal.exitLoudly);
+    }
+
+    /// A primitive rank 0 refused after its frame (step self.step - 1) went to the followers: with them, rank 0's
+    /// device drains and the error stands only once every follower refused the same frame (refusal.zig; else the Guard
+    /// ends the process). Returns `err` for the request.
+    fn refusing(self: *Lanes, err: anyerror) anyerror {
+        const g = self.guard orelse return err;
+        const step = self.step - 1;
+        g.note(step, 0, @errorName(err));
+        self.m.drain() catch |e| std.log.err("dsv41: rank 0's drain after a refusal: {s}", .{@errorName(e)});
+        _ = g.awaitAgreed(step);
+        return err;
+    }
+
     /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
     pub fn deinit(self: *Lanes) void {
+        if (self.guard) |g| g.stop(self.gpa); // before done: the followers' links close after it
+        self.guard = null;
         for (self.snaps.items) |sn| {
             sn.buf.free();
             self.gpa.destroy(sn);
@@ -541,7 +564,7 @@ pub const Lanes = struct {
             try self.wire.ids(gpa, seq.items);
             try self.flush();
         }
-        try m.fillBegin(slot, base);
+        m.fillBegin(slot, base) catch |err| return self.refusing(err);
         if (spans.items.len > 0) {
             // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
             // the ids of a full pool)
@@ -560,7 +583,7 @@ pub const Lanes = struct {
                 }
                 off += n;
             }
-            try m.setImages(spans.items, rows.items);
+            m.setImages(spans.items, rows.items) catch |err| return self.refusing(err);
         }
         const replay = len -| m.cfg.window;
         var start: usize = 0;
@@ -573,8 +596,8 @@ pub const Lanes = struct {
                 try self.wire.int(gpa, u64, sn.at);
                 try self.flush();
             }
-            if (base != sn.base) try m.copyExtent(sn.base, base, sn.at);
-            try m.snapCopy(slot, sn.buf.ptr, false);
+            if (base != sn.base) m.copyExtent(sn.base, base, sn.at) catch |err| return self.refusing(err);
+            m.snapCopy(slot, sn.buf.ptr, false) catch |err| return self.refusing(err);
             start = sn.at;
             s.cached = @intCast(sn.at);
         }
@@ -599,7 +622,7 @@ pub const Lanes = struct {
                 try self.wire.int(gpa, u64, replay);
                 try self.flush();
             }
-            head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
+            head = m.fillChunk(seq.items[0 .. start + n], start, n, replay) catch |err| return self.refusing(err);
             start += n;
             if (s.images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
         }
@@ -669,7 +692,7 @@ pub const Lanes = struct {
         }
         const t1 = m.now();
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
-        try m.verify(rows, self.built.absorb[0..windows.len]);
+        m.verify(rows, self.built.absorb[0..windows.len]) catch |err| return self.refusing(err);
         const t2 = m.now();
         // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
         var greedy = true;
@@ -753,7 +776,7 @@ pub const Lanes = struct {
             try self.flush();
         }
         const t0 = m.now();
-        try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps);
+        m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| return self.refusing(err);
         if (self.prof) |*p| {
             p.pass += m.now() - t0;
             p.passes += 1;
@@ -878,7 +901,7 @@ pub const Lanes = struct {
             try self.wire.int(self.gpa, u32, @intCast(l.slot));
             try self.flush();
         }
-        try self.m.snapCopy(l.slot, sn.buf.ptr, true);
+        self.m.snapCopy(l.slot, sn.buf.ptr, true) catch |err| return self.refusing(err);
         return sn;
     }
 
@@ -915,10 +938,16 @@ pub fn survivals(conf: []const f32, out: []f64) void {
     }
 }
 
-/// A primitive this rank refused: rank 0 runs the same one on the same inputs and refuses it at the same step (its
-/// request ends with the error), so the follower reports it and takes the next frame instead of ending.
-fn refused(err: anyerror) void {
-    std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
+/// A primitive this rank refused (frame `step`): its device drains, then rank 0 hears of it over the link (refusal.zig).
+/// When rank 0 and every other follower refused the same frame (the same primitive on the same inputs), rank 0's
+/// request ends with the error and this rank takes the next frame; a refusal the other ranks do not share (rank-
+/// dependent work: stage ZS2's MissingTritonVariant on one rank's rows) makes rank 0 end the run loudly instead of
+/// every rank waiting on the others for good.
+fn refused(m: *Model, peer: link.Link, step: u64, err: anyerror) void {
+    std.debug.print("{{\"follow_refused\": \"{s}\", \"step\": {d}}}\n", .{ @errorName(err), step });
+    m.drain() catch |e| std.log.err("dsv41: the drain after a refusal: {s}", .{@errorName(e)});
+    var b: [96]u8 = undefined;
+    peer.send(refusal.encodeReport(&b, step, @errorName(err))) catch |e| std.log.err("dsv41: rank 0 did not hear of the refusal: {s}", .{@errorName(e)});
 }
 
 /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
@@ -974,7 +1003,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (slot >= max_streams) return error.BadSlot;
                 img_rows.clearRetainingCapacity();
                 try r.ids(gpa, &seqs[slot]);
-                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                m.fillBegin(slot, @intCast(base)) catch |err| refused(m, peer, step - 1, err);
                 m.fill_seq = seqs[slot].items;
             },
             .fill_chunk => {
@@ -982,7 +1011,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const n: usize = try r.int(u32);
                 const replay: usize = @intCast(try r.int(u64));
                 if (start + n > seqs[slot].items.len) return error.BadChunk;
-                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
+                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(m, peer, step - 1, err);
             },
             .verify => {
                 const nw = try r.int(u32);
@@ -998,7 +1027,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     wins[k] = .{ .slot = s, .base = base, .end = end, .start = start, .absorb = absorb, .ids = win_ids[k].items };
                 }
                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
-                m.verify(rows, built.absorb[0..nw]) catch |err| refused(err);
+                m.verify(rows, built.absorb[0..nw]) catch |err| refused(m, peer, step - 1, err);
                 if (m.prof) {
                     follow_prof.rounds += 1;
                     follow_prof.enqueue += m.t_enqueue;
@@ -1017,7 +1046,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     q0[i] = try r.int(i64);
                     slots[i] = try r.int(i64);
                 }
-                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(err);
+                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(m, peer, step - 1, err);
             },
             .fill_images => {
                 const count = try r.int(u32);
@@ -1036,7 +1065,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (off != img_rows.items.len or off + piece.len > total or piece.len == 0) return error.BadFrame;
                 try img_rows.appendSlice(gpa, piece);
                 if (img_rows.items.len == total) {
-                    m.setImages(spans.items, img_rows.items) catch |err| refused(err);
+                    m.setImages(spans.items, img_rows.items) catch |err| refused(m, peer, step - 1, err);
                     img_rows.clearRetainingCapacity();
                 }
             },
@@ -1047,7 +1076,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 var b = try cuda.DeviceBuffer.alloc(m.ctx.d, m.snapBytes());
                 m.snapCopy(s, b.ptr, true) catch |err| {
                     b.free();
-                    refused(err);
+                    refused(m, peer, step - 1, err);
                     continue;
                 };
                 try kept.put(gpa, id, b);
@@ -1060,8 +1089,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const to: usize = @intCast(try r.int(u64));
                 const at: usize = @intCast(try r.int(u64));
                 const b = kept.get(id) orelse return error.UnknownSnapshot; // rank 0 restores only states both ranks keep
-                if (from != to) m.copyExtent(from, to, at) catch |err| refused(err);
-                m.snapCopy(s, b.ptr, false) catch |err| refused(err);
+                if (from != to) m.copyExtent(from, to, at) catch |err| refused(m, peer, step - 1, err);
+                m.snapCopy(s, b.ptr, false) catch |err| refused(m, peer, step - 1, err);
             },
             .snap_drop => {
                 const id = try r.int(u64);

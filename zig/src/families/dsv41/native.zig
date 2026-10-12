@@ -198,6 +198,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     });
     errdefer st.m.close();
     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
+    // a refusal on some ranks only (or a follower that ends) ends this process loudly instead of hanging the four
+    try st.lanes.startGuard();
+    errdefer if (st.lanes.guard) |g| g.stop(gpa);
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
     if (getenv("TF_DS_SERVED_K")) |t| st.lanes.served_k = if (std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "all")) .all else if (std.mem.eql(u8, t, "solo")) .solo else .off;
     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)

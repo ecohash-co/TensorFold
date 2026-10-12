@@ -7,9 +7,9 @@ const Stream = @import("stream.zig").Stream;
 const launch = @import("launch.zig");
 const triton = @import("triton.zig");
 
-const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
-const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
-const KernelJson = struct {
+pub const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
+pub const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
+pub const KernelJson = struct {
     @"fn": []const u8,
     hash: []const u8,
     name: []const u8,
@@ -23,7 +23,7 @@ const KernelJson = struct {
     params: []ParamJson,
     consts: std.json.ArrayHashMap(ConstJson),
 };
-const SetJson = struct { kernels: []KernelJson };
+pub const SetJson = struct { kernels: []KernelJson };
 
 /// One argument of a launch, by the kernel's parameter name.
 pub const Arg = struct {
@@ -87,7 +87,7 @@ pub const Set = struct {
         defer gpa.free(path);
         const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
         defer gpa.free(text);
-        const parsed = try std.json.parseFromSlice(SetJson, gpa, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        const parsed = try parseSet(gpa, text);
         errdefer parsed.deinit();
         const variants = try gpa.alloc(Variant, parsed.value.kernels.len);
         var n: usize = 0;
@@ -127,22 +127,9 @@ pub const Set = struct {
 
     /// `find`, the fallback's fit also allowing what `relax` lists (Relax).
     pub fn findRelaxed(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const, relax: Relax) !*const Variant {
-        if (!self.weakest) for (self.variants) |*v| {
-            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
-            if (matches(v.spec, args, consts)) return v;
-        };
-        var best: ?*Variant = null;
-        var best_held: usize = 0;
-        for (self.variants) |*v| {
-            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
-            const held = fits(v.spec, args, consts, relax) orelse continue;
-            const better = if (self.weakest) held < best_held else held > best_held;
-            if (best == null or better) {
-                best = v;
-                best_held = held;
-            }
-        }
-        if (best) |v| {
+        if (pick(self.parsed.value.kernels, function, args, consts, relax, self.weakest)) |got| {
+            const v = &self.variants[got.index];
+            if (got.exact) return v;
             if (!v.told.swap(true, .monotonic)) std.log.warn("{s}: a launch whose specialization no captured variant has runs variant {s} (assumes less)", .{ function, v.spec.hash[0..@min(12, v.spec.hash.len)] });
             return v;
         }
@@ -188,6 +175,34 @@ pub const Set = struct {
         try v.kernel.launchOn(.{ .x = grid[0], .y = grid[1], .z = grid[2] }, stream, &packed_args, .{}, &.{});
     }
 };
+
+/// The variant `Set.findRelaxed` takes among `kernels` (an aot.json's, in its order; Set.variants is loaded in the same
+/// order), by index: the one captured for this launch exactly (unless `weakest`), else the fitting one that holds the
+/// most of the launch's specializations (the fewest with `weakest`; ties: the first). Null: none fits (the launch is
+/// refused with error.MissingTritonVariant). Host only: what a launch would run, without loading a cubin.
+pub fn pick(kernels: []const KernelJson, function: []const u8, args: []const Arg, consts: []const Const, relax: Relax, weakest: bool) ?struct { index: usize, exact: bool } {
+    if (!weakest) for (kernels, 0..) |k, i| {
+        if (!std.mem.eql(u8, k.@"fn", function)) continue;
+        if (matches(k, args, consts)) return .{ .index = i, .exact = true };
+    };
+    var best: ?usize = null;
+    var best_held: usize = 0;
+    for (kernels, 0..) |k, i| {
+        if (!std.mem.eql(u8, k.@"fn", function)) continue;
+        const held = fits(k, args, consts, relax) orelse continue;
+        const better = if (weakest) held < best_held else held > best_held;
+        if (best == null or better) {
+            best = i;
+            best_held = held;
+        }
+    }
+    return if (best) |i| .{ .index = i, .exact = false } else null;
+}
+
+/// An aot.json's text parsed as Set.load parses it (host tests of `pick` against a captured kit).
+pub fn parseSet(gpa: std.mem.Allocator, text: []const u8) !std.json.Parsed(SetJson) {
+    return std.json.parseFromSlice(SetJson, gpa, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}
 
 fn lookup(args: []const Arg, name: []const u8) ?Arg {
     for (args) |a| if (std.mem.eql(u8, a.name, name)) return a;

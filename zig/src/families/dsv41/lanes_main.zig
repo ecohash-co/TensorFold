@@ -177,6 +177,7 @@ pub fn main(init: std.process.Init) !u8 {
     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
     var ln = dsv41.lanes.Lanes.init(gpa, m);
     defer ln.deinit();
+    try ln.startGuard();
     ln.fix_k = fix_k;
     if (profile) {
         ln.prof = .{};

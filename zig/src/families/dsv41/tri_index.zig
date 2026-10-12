@@ -63,34 +63,52 @@ pub const IndexK = union(enum) {
 /// index_keys' cand: the candidate pool's block mask (bool [R, >= cdiv(n, cand_block)], read as u8) and its row stride.
 pub const Cand = struct { mask: u64, stride: usize };
 
-/// index_score's fp32 scores without bases: beyond aot's fallback (n, nt div 16 onto any-value variants), VIS, KB and
-/// CAND 8-aligned onto variants that assumed 16, which _index_score's variants (KEYS=0, HAS_BASE=0, PACKED=1) do not
-/// depend on (they read VIS as one int64 a row, KB and CAND not at all).
+/// index_score without bases on FP4 keys (fp32 scores; int64 keys with tile maxima): beyond aot's fallback (n, nt div
+/// 16 onto any-value variants), VIS, KB and CAND 8-aligned onto variants that assumed 16. _index_score's variants of
+/// these two configurations (HAS_BASE=0, HAS_CAND=0, PACKED=1; KEYS=0 HAS_TMAX=0, or KEYS=1 HAS_TMAX=1) do not depend
+/// on it: they read VIS as one int64 a row (LDC.64 c[0x3a0], + ctaid.x * 8, LDG.E.64) and KB, CAND and cs not at all
+/// (no load of c[0x3b8], c[0x3c0], c[0x3c8]), and the captured pairs that differ only in VIS/KB/CAND's alignment have
+/// byte-identical SASS (KEYS=1: 9f83460754 and 45c81d5893; KEYS=0: missing-variant.md, stage ZG).
 const score_relax: aot.Relax = .{ .ptrs8 = &.{ "VIS", "KB", "CAND" } };
 
-/// index_score: q [R, IH, ID], k, w [R, IH], vis [R] -> out [R, n] fp32 scores; `keys`: int64 keys; `tmax`: tile maxima.
-pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u64, base: ?u64, keys: bool, tmax: ?u64, rowwise: bool, rows: usize, ih: usize, id: usize) !void {
+/// The relaxation index_score's _index_score launch takes (score_relax where its SASS says the alignment of VIS, KB
+/// and CAND is not read; else none): a prompt row block of at most decode_rows rows puts vis 8 bytes in when it starts
+/// at an odd row (rb odd: n_comp_end in 162K..), fp32 scores (layers 20-39) and keyed ones (layers 2-19) alike.
+pub fn scoreRelax(k: IndexK, base: ?u64, keys: bool, tmax: ?u64) aot.Relax {
+    if (base != null or k != .fp4) return .{};
+    return if (!keys or tmax != null) score_relax else .{};
+}
+
+/// _index_score's arguments and constexprs as index_score passes them (rows <= decode_rows or rowwise).
+pub fn scoreArgs(q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u64, base: ?u64, keys: bool, tmax: ?u64) [12]aot.Arg {
     const nt = tri.cdiv(n, tile);
     const ot: []const u8 = if (keys) "*i64" else "*fp32";
     // tmax [R, cdiv(n, 64)] int64 (its maxima only with keys); without it the kernel gets out there
     const tm = p("TMAX", if (tmax != null) "*i64" else ot, tmax orelse out);
+    // base [R]: each row's first pool row (concurrent rounds); vis stands in for it and for the candidate mask
+    return .{
+        p("Q", "*bf16", q),    p("K", k.ty(), k.codes()), p("KS", k.ty(), k.scales()), p("Wt", "*bf16", w),
+        p("VIS", "*i64", vis), p("OUT", ot, out),         int("n", n),                 p("KB", "*i64", base orelse vis),
+        p("CAND", "*i64", vis), int("cs", 0),             tm,                          int("nt", nt),
+    };
+}
+
+pub fn scoreConsts(k: IndexK, base: ?u64, keys: bool, tmax: ?u64, ih: usize, id: usize, pdl: aot.Const) [12]aot.Const {
+    // HAS_CAND, CB and DEAD_PAD at the kernel's defaults (index_score passes none of them)
+    // SKIP_DEAD: switch "tile_skip" (served on), a tile wholly at or past vis skips its dots
+    return .{
+        ci("IH", ih),          ci("ID", id), ci("BN", tile),   cb("PACKED", k == .fp4),               cb("HAS_BASE", base != null), pdl,
+        cb("HAS_CAND", false), ci("CB", 8),  cb("KEYS", keys), cb("HAS_TMAX", tmax != null and keys), cb("SKIP_DEAD", true),        cb("DEAD_PAD", false),
+    };
+}
+
+/// index_score: q [R, IH, ID], k, w [R, IH], vis [R] -> out [R, n] fp32 scores; `keys`: int64 keys; `tmax`: tile maxima.
+pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u64, base: ?u64, keys: bool, tmax: ?u64, rowwise: bool, rows: usize, ih: usize, id: usize) !void {
     if (rows <= tri.decode_rows or rowwise) {
-        // base [R]: each row's first pool row (concurrent rounds); vis stands in for it and for the candidate mask
-        // HAS_CAND, CB and DEAD_PAD at the kernel's defaults (index_score passes none of them)
-        // SKIP_DEAD: switch "tile_skip" (served on), a tile wholly at or past vis skips its dots
-        // fp32 scores of FP4 keys without bases (prompt row blocks of at most decode_rows rows): the kit captured
-        // n and nt not divisible by 16 and vis 16-aligned only. aot's fallback runs a div-16 n or nt on that variant
-        // (5f4fceb20c); an odd row block puts vis 8 bytes in, which upstream's fallback refuses, but this code reads
-        // KB, CAND, cs, TMAX and nt not at all and vis as one int64 a row (captured cubins' SASS: missing-variant.md)
-        const relax: aot.Relax = if (!keys and base == null and k == .fp4) score_relax else .{};
-        return t.runRelaxed("_index_score", .{ u(rows), nt, 1 }, &.{
-            p("Q", "*bf16", q),     p("K", k.ty(), k.codes()), p("KS", k.ty(), k.scales()), p("Wt", "*bf16", w),
-            p("VIS", "*i64", vis),  p("OUT", ot, out),         int("n", n),                 p("KB", "*i64", base orelse vis),
-            p("CAND", "*i64", vis), int("cs", 0),              tm,                          int("nt", nt),
-        }, &.{
-            ci("IH", ih),          ci("ID", id), ci("BN", tile),   cb("PACKED", k == .fp4),               cb("HAS_BASE", base != null), t.pdlConst(),
-            cb("HAS_CAND", false), ci("CB", 8),  cb("KEYS", keys), cb("HAS_TMAX", tmax != null and keys), cb("SKIP_DEAD", true),        cb("DEAD_PAD", false),
-        }, relax);
+        const nt = tri.cdiv(n, tile);
+        const args = scoreArgs(q, k, w, vis, n, out, base, keys, tmax);
+        const consts = scoreConsts(k, base, keys, tmax, ih, id, t.pdlConst());
+        return t.runRelaxed("_index_score", .{ u(rows), nt, 1 }, &args, &consts, scoreRelax(k, base, keys, tmax));
     }
     std.debug.assert(base == null);
     return indexScoreRows(t, q, k, w, vis, n, out, keys, tmax, rows, ih, id);
@@ -235,6 +253,97 @@ test "index_score and index_keys launch _index_score as recorded" {
             try indexScore(t, c.ptr("Q"), caseK(c), c.ptr("Wt"), c.ptr("VIS"), n, c.ptr("OUT"), base, keys, tmax, false, rows, c.dim("Q", 1), c.dim("Q", 2));
         }
     }.call);
+}
+
+/// Stage ZS2's refused launch (helen's log, results/stageZS2/hang-log-helen.txt): a keyed prompt row block's tail of at
+/// most decode_rows rows at an odd row (rb 207 at n_comp_end 80809), so vis 8 bytes off 16; n and nt not div 16.
+fn zs2(kernels: []const aot.KernelJson, vis: u64, n: usize) !?struct { hash: []const u8, exact: bool, night4: bool } {
+    const k: IndexK = .{ .fp4 = .{ .codes = 0xe3dd526d0000, .scales = 0xe3dd2b201300 } };
+    const tmax: ?u64 = 0xe3e2b5c48200;
+    const args = scoreArgs(0xe3e2b4a0e200, k, 0xe3e2b5c1d3c0, vis, n, 0xe3e36f800000, null, true, tmax);
+    const consts = scoreConsts(k, null, true, tmax, 32, 128, aot.ci("PDL", 1));
+    const night4 = aot.pick(kernels, "_index_score", &args, &consts, .{}, false) != null; // night4: no relaxation when keyed
+    const got = aot.pick(kernels, "_index_score", &args, &consts, scoreRelax(k, null, true, tmax), false) orelse return null;
+    return .{ .hash = kernels[got.index].hash, .exact = got.exact, .night4 = night4 };
+}
+
+fn expectZs2(kernels: []const aot.KernelJson) !void {
+    const expect = std.testing.expect;
+    const vis: u64 = 0xe3e2b5c43c38;
+    // the logged launch: night4 refused it (MissingTritonVariant); now fa1370b0f6 (n, nt any, VIS/KB/CAND 16) runs it
+    const a = (try zs2(kernels, vis, 80809)).?;
+    try expect(!a.night4 and !a.exact and std.mem.startsWith(u8, a.hash, "fa1370b0f6"));
+    // the same block 16-aligned: that variant exactly, as before
+    const b = (try zs2(kernels, vis + 8, 80809)).?;
+    try expect(b.night4 and b.exact and std.mem.startsWith(u8, b.hash, "fa1370b0f6"));
+    // n and nt div 16 with vis 8 in: the captured 45c81d5893 exactly (no relaxation needed or taken)
+    const c = (try zs2(kernels, vis, 1024 * 64)).?;
+    try expect(c.night4 and c.exact and std.mem.startsWith(u8, c.hash, "45c81d5893"));
+    // 4-aligned never
+    try expect(try zs2(kernels, vis + 4, 80809) == null);
+}
+
+test "stage ZS2's refused _index_score launch (keyed, VIS 8 bytes in, n 80809, nt 1263) runs the captured fa1370b0f6" {
+    const gpa = std.testing.allocator;
+    // the kit's KEYS=1 HAS_BASE=0 HAS_TMAX=1 variants (aot.json entries, cut to the fields a pick reads)
+    const set = try aot.parseSet(gpa, @embedFile("fixtures/index_score_keyed_variants.json"));
+    defer set.deinit();
+    try expectZs2(set.value.kernels);
+    // the args as logged
+    const k: IndexK = .{ .fp4 = .{ .codes = 1, .scales = 2 } };
+    const args = scoreArgs(0, k, 0, 0xe3e2b5c43c38, 80809, 0, null, true, 3);
+    try std.testing.expectEqual(@as(i32, 1263), args[11].value.i32);
+    try std.testing.expectEqual(args[4].value.ptr.addr, args[7].value.ptr.addr); // KB, CAND: vis
+    try std.testing.expectEqual(args[4].value.ptr.addr, args[8].value.ptr.addr);
+    // the relaxation only where the SASS was read: never with bases, bf16 keys, or keys without tile maxima
+    try std.testing.expectEqual(@as(usize, 3), scoreRelax(k, null, true, 3).ptrs8.len);
+    try std.testing.expectEqual(@as(usize, 3), scoreRelax(k, null, false, null).ptrs8.len);
+    try std.testing.expectEqual(@as(usize, 0), scoreRelax(k, 5, true, 3).ptrs8.len);
+    try std.testing.expectEqual(@as(usize, 0), scoreRelax(k, null, true, null).ptrs8.len);
+    try std.testing.expectEqual(@as(usize, 0), scoreRelax(.{ .bf16 = 1 }, null, false, null).ptrs8.len);
+    // with the whole captured kit when it is on this host (TF_TEST_AOT_JSON; skipped when unset)
+    const path: []const u8 = if (std.c.getenv("TF_TEST_AOT_JSON")) |v| std.mem.span(v) else return;
+    const text = std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1 << 24)) catch return;
+    defer gpa.free(text);
+    const kit = try aot.parseSet(gpa, text);
+    defer kit.deinit();
+    try expectZs2(kit.value.kernels);
+}
+
+test "every keyed prompt row block of at most decode_rows rows finds a variant, at every prompt length to 1M" {
+    // prompt.selectRows(Part)'s blocks: the passes' 2,048-row runs [s0, s0 + sn) (s0 % 2048 == 0), the keyed layers'
+    // n_comp_end (s0 + sn) / 2, blocks of rowBlock rows; a block of at most decode_rows rows past the first starts at
+    // row s0 + k rb, its vis k rb int64s into the run. Only a prompt's last, partial run can leave one (whole runs:
+    // n_comp_end % 1024 == 0, n and nt div 16, the captured 45c81d5893 / 9f83460754 exactly). night4 refused 2,294
+    // prompt lengths up to 200K this way (18,226 the first; stage ZS2's 161,618-161,619), night3 3,085.
+    const gpa = std.testing.allocator;
+    const set = try aot.parseSet(gpa, @embedFile("fixtures/index_score_keyed_variants.json"));
+    defer set.deinit();
+    const rowBlock = @import("prompt.zig").rowBlock;
+    const k: IndexK = .{ .fp4 = .{ .codes = 0x10000, .scales = 0x20000 } };
+    const tmax: ?u64 = 0x30000;
+    var tails: usize = 0;
+    var night4: usize = 0;
+    var len: usize = 1;
+    while (len <= 1 << 20) : (len += 1) {
+        const sn = len % 2048;
+        if (sn == 0) continue;
+        const nce = len / 2;
+        const rb = rowBlock(sn, nce);
+        const blocks = sn / rb;
+        const m = sn - blocks * rb;
+        if (blocks == 0 or m == 0 or m > decode_rows) continue;
+        tails += 1;
+        const vis: u64 = 0x40000 + blocks * rb * 8;
+        const args = scoreArgs(0x50000, k, 0x60000, vis, nce, 0x70000, null, true, tmax);
+        const consts = scoreConsts(k, null, true, tmax, 32, 128, aot.ci("PDL", 1));
+        if (aot.pick(set.value.kernels, "_index_score", &args, &consts, .{}, false) == null) night4 += 1;
+        if (aot.pick(set.value.kernels, "_index_score", &args, &consts, scoreRelax(k, null, true, tmax), false) == null) {
+            std.debug.print("no variant at prompt length {d}\n", .{len});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(tails > 0 and night4 > 0);
 }
 
 test "index_score (prompt chunks) launches _index_score_rows as recorded" {

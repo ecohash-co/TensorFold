@@ -18,14 +18,16 @@ pub const Tri = struct {
 
     pub fn run(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
         if (t.log) |l| return l.add(name, grid, args, consts);
-        try t.set.?.run(t.stream, name, grid, args, consts);
+        try t.set.?.runRelaxed(t.stream, name, grid, args, consts, proven);
     }
 
     /// `run`, the variant matched as `relax` allows when none was captured for the launch exactly (aot.Set.findRelaxed);
     /// a test log keeps the launch as given.
     pub fn runRelaxed(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const, relax: aot.Relax) !void {
         if (t.log) |l| return l.add(name, grid, args, consts);
-        try t.set.?.runRelaxed(t.stream, name, grid, args, consts, relax);
+        var r = relax;
+        if (r.proven.len == 0) r.proven = proven.proven;
+        try t.set.?.runRelaxed(t.stream, name, grid, args, consts, r);
     }
 
     /// The PDL constexpr a wrapper passes when its kernel takes one (_pdl() in kernels.py).
@@ -33,6 +35,11 @@ pub const Tri = struct {
         return aot.ci("PDL", @intFromBool(t.pdl));
     }
 };
+
+/// Every launch's last resort (aot.Relax.proven): a variant whose SASS reads or writes an int64 pointer it took as
+/// 16-aligned only with accesses of at most 8 bytes runs a launch with that pointer 8-aligned (row slices of int64
+/// arrays: a replay cut's pos, an odd row block's vis, a round's pos past R rows) when no variant fits otherwise.
+pub const proven: aot.Relax = .{ .proven = &@import("aot_ptr8.zig").variants };
 
 pub fn u(x: usize) u32 {
     return @intCast(x);

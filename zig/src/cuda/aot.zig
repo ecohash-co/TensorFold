@@ -67,9 +67,22 @@ const Variant = struct {
 /// reads as one 8-byte scalar, or not at all). Such an argument counts as not held. Empty: upstream's rule only.
 pub const Relax = struct {
     ptrs8: []const []const u8 = &.{},
+    /// Per captured variant (by its hash): pointers its SASS reads and writes only with accesses of at most 8 bytes,
+    /// or not at all, so they may be 8-aligned where it assumed 16 (a kit's generated table, e.g. dsv41's
+    /// aot_ptr8.zig). Taken only when nothing fits without it (`pick`): a launch that ran before keeps its variant.
+    proven: []const Proven = &.{},
+
+    pub const Proven = struct { hash: []const u8, ptrs8: []const []const u8 };
 
     fn has(names: []const []const u8, name: []const u8) bool {
         for (names) |x| if (std.mem.eql(u8, x, name)) return true;
+        return false;
+    }
+
+    /// Whether `name` may be 8-aligned on variant `hash`.
+    fn allows(r: Relax, hash: []const u8, name: []const u8) bool {
+        if (has(r.ptrs8, name)) return true;
+        for (r.proven) |v| if (std.mem.eql(u8, v.hash, hash)) return has(v.ptrs8, name);
         return false;
     }
 };
@@ -185,6 +198,16 @@ pub fn pick(kernels: []const KernelJson, function: []const u8, args: []const Arg
         if (!std.mem.eql(u8, k.@"fn", function)) continue;
         if (matches(k, args, consts)) return .{ .index = i, .exact = true };
     };
+    // the call site's own relaxation first (as before relax.proven), then the proven pointers too
+    var r = relax;
+    r.proven = &.{};
+    if (fitting(kernels, function, args, consts, r, weakest)) |i| return .{ .index = i, .exact = false };
+    if (relax.proven.len == 0) return null;
+    if (fitting(kernels, function, args, consts, relax, weakest)) |i| return .{ .index = i, .exact = false };
+    return null;
+}
+
+fn fitting(kernels: []const KernelJson, function: []const u8, args: []const Arg, consts: []const Const, relax: Relax, weakest: bool) ?usize {
     var best: ?usize = null;
     var best_held: usize = 0;
     for (kernels, 0..) |k, i| {
@@ -196,7 +219,7 @@ pub fn pick(kernels: []const KernelJson, function: []const u8, args: []const Arg
             best_held = held;
         }
     }
-    return if (best) |i| .{ .index = i, .exact = false } else null;
+    return best;
 }
 
 /// An aot.json's text parsed as Set.load parses it (host tests of `pick` against a captured kit).
@@ -243,7 +266,7 @@ fn fits(k: KernelJson, args: []const Arg, consts: []const Const, relax: Relax) ?
                 const p = param orelse return null;
                 if (!std.mem.eql(u8, p.type, x.ty)) return null;
                 const d16 = x.addr % 16 == 0;
-                if (p.div16 and !d16 and !(x.addr % 8 == 0 and Relax.has(relax.ptrs8, a.name))) return null;
+                if (p.div16 and !d16 and !(x.addr % 8 == 0 and relax.allows(k.hash, a.name))) return null;
                 if (p.div16 == d16) held += 1;
             },
             .f32 => {
@@ -337,4 +360,29 @@ test "fallback fit: the most specializations held, assumptions never broken; 8-a
     try expect(fits(k5, &.{ ptr("VIS", "*i64", 0x1004), int("n", 146421), int("nt", 2289) }, &consts, rx) == null);
     try expect(fits(k6, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421), int("nt", 1) }, &consts, rx) == null);
     try expect(fits(k5, &.{ ptr("VIS", "*i64", 0x1000), int("n", 146421), int("nt", 2289) }, &.{ci("KEYS", 1)}, rx) == null);
+}
+
+test "proven 8-aligned pointers: only on the listed variant, only after every other fit, never under 8" {
+    const gpa = std.testing.allocator;
+    const expect = std.testing.expect;
+    const P = ParamJson;
+    var pa = [_]P{ .{ .name = "POS", .type = "*i64", .div16 = true, .nospec = false }, .{ .name = "n", .type = "i32", .div16 = false, .nospec = false } };
+    var pb = [_]P{ .{ .name = "POS", .type = "*i64", .div16 = true, .nospec = false }, .{ .name = "n", .type = "i32", .div16 = true, .nospec = false } };
+    var ks = [_]KernelJson{
+        .{ .@"fn" = "f", .hash = "aaaa", .name = "f", .num_warps = 4, .params = &pa, .consts = .{} },
+        .{ .@"fn" = "f", .hash = "bbbb", .name = "f", .num_warps = 4, .params = &pb, .consts = .{} },
+    };
+    const proven: Relax = .{ .proven = &.{.{ .hash = "aaaa", .ptrs8 = &.{"POS"} }} };
+    // exact first
+    try expect(pick(&ks, "f", &.{ ptr("POS", "*i64", 0x1000), int("n", 33) }, &.{}, proven, false).?.index == 0);
+    // n div 16, POS aligned: bbbb exactly
+    const e = pick(&ks, "f", &.{ ptr("POS", "*i64", 0x1000), int("n", 32) }, &.{}, proven, false).?;
+    try expect(e.exact and e.index == 1);
+    // POS 8 off: only aaaa is proven (n 32 onto its any-n), and only with the table
+    try expect(pick(&ks, "f", &.{ ptr("POS", "*i64", 0x1008), int("n", 32) }, &.{}, .{}, false) == null);
+    const r = pick(&ks, "f", &.{ ptr("POS", "*i64", 0x1008), int("n", 32) }, &.{}, proven, false).?;
+    try expect(!r.exact and r.index == 0);
+    // 4 off never
+    try expect(pick(&ks, "f", &.{ ptr("POS", "*i64", 0x1004), int("n", 33) }, &.{}, proven, false) == null);
+    _ = gpa;
 }

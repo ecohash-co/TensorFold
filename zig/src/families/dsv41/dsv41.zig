@@ -55,6 +55,8 @@ pub const sampling = @import("sampling.zig");
 pub const model = @import("model.zig");
 pub const lanes = @import("lanes.zig");
 pub const refusal = @import("refusal.zig");
+pub const aot_ptr8 = @import("aot_ptr8.zig");
+pub const ptr8_check = @import("ptr8_check.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -107,4 +109,6 @@ test {
     refAll(model);
     refAll(lanes);
     refAll(refusal);
+    refAll(aot_ptr8);
+    refAll(ptr8_check);
 }

@@ -71,8 +71,11 @@ pub const Attn = struct {
     one_split: bool = false,
 };
 
-/// sparse_attn: q -> out (o [R, H, HD]); window keys from wsrc, compressed keys comp[idx[r, j]].
-pub fn sparseAttn(t: Tri, a: Attn) !void {
+/// _sparse_attn_part's launch as sparse_attn makes it: its grid, arguments and constexprs, and whether it is final
+/// (one split writing out; else the merge follows over parts).
+pub const Part = struct { grid: [3]u32, args: [17]aot.Arg, consts: [14]aot.Const, final: bool, sp: usize, pp: Parts, groups: usize };
+
+pub fn part(a: Attn, pdl: aot.Const) !Part {
     const hb = 16;
     const bn = 32;
     const has = a.comp != .none and a.n_idx > 0;
@@ -104,17 +107,28 @@ pub fn sparseAttn(t: Tri, a: Attn) !void {
     const cbase = if (based) a.cbase orelse a.wbase.? else a.pos;
     // switch "attn_pf" (on in the served build): a split's window keys into L2 before its PDL wait
     const wpf = a.ring and !final;
-    try t.run("_sparse_attn_part", .{ u(a.rows), u(groups), u(sp) }, &.{
+    return .{ .grid = .{ u(a.rows), u(groups), u(sp) }, .final = final, .sp = sp, .pp = pp, .groups = groups, .args = .{
         p("Q", "*bf16", a.q),              p("WSRC", "*bf16", a.wsrc),                  p("WLO", "*i64", a.wlo),    p("COMP", ct, codes),
         p("CSC", ct, csc),                 p("IDX", "*i64", if (has) a.idx else a.pos), p("POS", "*i64", a.pos),    p("PM", pt, pp.pm),
         p("PL", pt, pp.pl),                p("PO", pt, pp.po),                          p("SINK", "*fp32", a.sink), p("OUT", "*bf16", a.out),
         aot.float("scale", a.scale),       p("RBASE", "*i64", rbase),                   p("CBASE", "*i64", cbase),  aot.int("ring_size", @intCast(ring_size)),
         aot.int("n_idx", @intCast(n_idx)),
-    }, &.{
+    }, .consts = .{
         ci("H", a.h),       ci("HD", a.hd),        ci("HB", hb),       ci("WIN", a.window), ci("BN", bn),
         cb("RING", a.ring), cb("HAS_COMP", has),   cb("PACKED", pack), ci("SPLITS", sp),    ci("NBLK", nblk),
-        cb("FINAL", final), cb("HAS_BASE", based), t.pdlConst(),       cb("WPF", wpf),
-    });
+        cb("FINAL", final), cb("HAS_BASE", based), pdl,                cb("WPF", wpf),
+    } };
+}
+
+/// sparse_attn: q -> out (o [R, H, HD]); window keys from wsrc, compressed keys comp[idx[r, j]].
+pub fn sparseAttn(t: Tri, a: Attn) !void {
+    const hb = 16;
+    const pt = try part(a, t.pdlConst());
+    try t.run("_sparse_attn_part", pt.grid, &pt.args, &pt.consts);
+    const final = pt.final;
+    const sp = pt.sp;
+    const pp = pt.pp;
+    const groups = pt.groups;
     if (final) return;
     const merged = [_]aot.Arg{ p("PM", "*fp32", pp.pm), p("PL", "*fp32", pp.pl), p("PO", "*fp32", pp.po), p("SINK", "*fp32", a.sink), p("OUT", "*bf16", a.out) };
     if (a.rot) |r| {

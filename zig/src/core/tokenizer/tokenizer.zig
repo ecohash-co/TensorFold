@@ -179,6 +179,15 @@ pub const Tokenizer = struct {
         return out.items;
     }
 
+    /// A token's raw bytes: a byte-level vocabulary's piece mapped back to its bytes (a piece that ends mid-character
+    /// keeps its partial bytes, which `decode` would repair to U+FFFD), else the piece itself; unknown ids: empty.
+    /// Caller frees with `a`.
+    pub fn tokenBytes(t: *const Tokenizer, a: Allocator, id: u32) Allocator.Error![]u8 {
+        const token = t.id_to_token.get(id) orelse return a.dupe(u8, "");
+        if (t.decoder) |*d| if (d.byteLevel()) return steps.byteLevelBytes(a, token);
+        return a.dupe(u8, token);
+    }
+
     /// Text for `ids` through the decoder chain; unknown ids are skipped. Caller frees with `a`.
     pub fn decode(t: *const Tokenizer, a: Allocator, ids: []const u32, skip_special_tokens: bool) Error![]u8 {
         var arena = std.heap.ArenaAllocator.init(a);

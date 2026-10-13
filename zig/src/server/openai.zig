@@ -18,6 +18,7 @@ const http_body = @import("http_body.zig");
 const routes = @import("routes.zig");
 const Server = @import("server.zig").Server;
 const Conn = @import("http_conn.zig").Conn;
+const api = @import("engine_api");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -118,9 +119,10 @@ const Plan = struct {
 fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const body = try fields.parseNumbers(cx, raw);
     try fields.validateModalities(cx, body);
-    try fields.probabilityOptions(cx, body);
+    const logprobs = try fields.probabilityOptions(cx, body, srv.info.logprobs);
+    const force = try fields.forcedTokens(cx, body, srv.text.vocabSize(), srv.info.logprobs);
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
-    var input: chat.Input = .{ .fields = undefined };
+    var input: chat.Input = .{ .fields = undefined, .logprobs = logprobs, .force = force };
     // an engine with vision takes image parts: their placeholders in the text, their bytes in input.images
     var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "" };
     const take: ?*messages.Images = if (srv.info.vision != null) &images else null;
@@ -245,6 +247,8 @@ const Run = struct {
     created: i64,
     streamed_prose: bool = false,
     prose_sent: std.ArrayList(u8) = .empty, // the content a tool stream sent
+    scored: chat.Scored = .{}, // a stream's token reports (logprobs), each carried by the first chunk sent after it lands
+    pieces: std.AutoHashMapUnmanaged(u32, Piece) = .empty, // each reported token's text and bytes, once per reply
 
     fn chunk(r: *Run, delta: ?Value, finish: ?[]const u8) Allocator.Error!Value {
         const a = r.a;
@@ -271,7 +275,63 @@ const Run = struct {
     }
 
     fn emit(r: *Run, payload: Value) error{Closed}!void {
+        if (r.plan.input.logprobs != null) r.carryLogprobs(payload) catch return error.Closed;
         return r.out.vt.event(r.out.ctx, payload);
+    }
+
+    /// A streamed chunk with a choice carries the token reports that landed since the last one that did (OpenAI's
+    /// ``choices[0].logprobs.content``); a chunk sent before any new token lands carries none.
+    fn carryLogprobs(r: *Run, payload: Value) Allocator.Error!void {
+        if (payload != .object) return;
+        const choices = payload.object.get("choices") orelse return;
+        if (choices != .array or choices.array.len == 0 or choices.array[0] != .object) return;
+        const fresh = r.scored.take();
+        if (fresh.len == 0) return;
+        try choices.array[0].object.put(r.a, "logprobs", try r.logprobsValue(fresh));
+    }
+
+    /// A token's text (its decode alone: a split character shows as U+FFFD) and its raw bytes, as a report shows it.
+    const Piece = struct { token: Value, bytes: Value };
+
+    fn piece(r: *Run, id: u32) Allocator.Error!Piece {
+        const got = try r.pieces.getOrPut(r.a, id);
+        if (got.found_existing) return got.value_ptr.*;
+        const text = try r.srv.text.decode(r.a, &.{id});
+        const raw = try r.srv.text.tokenBytes(r.a, id);
+        const bytes = try r.a.alloc(Value, raw.len);
+        for (raw, bytes) |b, *slot| slot.* = try json.intValue(r.a, b);
+        got.value_ptr.* = .{ .token = .{ .string = text }, .bytes = .{ .array = bytes } };
+        return got.value_ptr.*;
+    }
+
+    /// One token's entry: OpenAI's {token, logprob, bytes} and ours, token_id (the id compared across builds).
+    fn tokenEntry(r: *Run, id: u32, logprob: f64) Allocator.Error!*json.Object {
+        const a = r.a;
+        const p = try r.piece(id);
+        const o = try json.newObject(a);
+        try o.put(a, "token", p.token);
+        try o.put(a, "logprob", .{ .float = if (std.math.isFinite(logprob)) logprob else -9999.0 });
+        try o.put(a, "bytes", p.bytes);
+        try o.put(a, "token_id", try json.intValue(a, id));
+        return o;
+    }
+
+    /// ``{"content": [...]}`` for these reports: each token's entry with its row's top_logprobs (best first). A token
+    /// no row scored (forced past its row by the thinking budget) shows OpenAI's floor, -9999.0, and ``unscored``.
+    fn logprobsValue(r: *Run, reports: []const api.TokenLogprob) Allocator.Error!Value {
+        const a = r.a;
+        const content = try a.alloc(Value, reports.len);
+        for (reports, content) |*t, *slot| {
+            const o = try r.tokenEntry(t.token, t.logprob);
+            const top = try a.alloc(Value, t.n);
+            for (t.ids[0..t.n], t.lps[0..t.n], top) |id, lp, *e| e.* = .{ .object = try r.tokenEntry(id, lp) };
+            try o.put(a, "top_logprobs", .{ .array = top });
+            if (!t.scored()) try o.put(a, "unscored", .{ .bool = true });
+            slot.* = .{ .object = o };
+        }
+        const out = try json.newObject(a);
+        try out.put(a, "content", .{ .array = content });
+        return .{ .object = out };
     }
 
     fn usage(r: *Run, reply: *const chat.Reply) Allocator.Error!Value {
@@ -362,6 +422,7 @@ const Run = struct {
         try o.put(a, "model", .{ .string = r.plan.named });
         const choice = try json.newObject(a);
         try choice.put(a, "index", .{ .int = "0" });
+        const lp: Value = if (reply.scored) |sc| try r.logprobsValue(sc) else .null;
         if (r.is_chat) {
             const message = try json.newObject(a);
             try message.put(a, "role", .{ .string = "assistant" });
@@ -369,11 +430,12 @@ const Run = struct {
             if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
             try choice.put(a, "message", .{ .object = message });
+            if (reply.scored != null) try choice.put(a, "logprobs", lp);
             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
         } else {
             try choice.put(a, "text", .{ .string = reply.content });
             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
-            try choice.put(a, "logprobs", .null);
+            try choice.put(a, "logprobs", lp);
         }
         const list = try a.alloc(Value, 1);
         list[0] = .{ .object = choice };
@@ -456,7 +518,7 @@ const Run = struct {
         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
         var sink_state: StreamSink = .{ .run = r, .tools = tools };
         handed = true;
-        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call }, gone) catch |e| {
+        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .scored = &r.scored }, gone) catch |e| {
             switch (e) {
                 error.Cancelled => return,
                 error.Refused => if (cx.kind != .other and cx.kind != .server) {

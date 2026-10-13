@@ -120,6 +120,20 @@ pub const ScriptEngine = struct {
             }
             const landed: u32 = @intCast(emitted.items.len - start);
             if (landed > 0) {
+                // TF_FAKE_LOGPROBS: each token's report, its logprob -0.125 per token so far, its row's best the
+                // token then the next id
+                if (r.logprobs) |top| {
+                    var reports: std.ArrayList(api.TokenLogprob) = .empty;
+                    for (emitted.items[start..], start..) |t, i| {
+                        var rep: api.TokenLogprob = .{ .token = t, .logprob = -0.125 * @as(f64, @floatFromInt(i)), .n = @min(top, 2) };
+                        rep.ids[0] = t;
+                        rep.lps[0] = rep.logprob;
+                        rep.ids[1] = t + 1;
+                        rep.lps[1] = rep.logprob - 1.0;
+                        reports.append(a, rep) catch {};
+                    }
+                    sink.event(sink.ctx, id, &.{ .logprobs = reports.items });
+                }
                 sink.event(sink.ctx, id, &.{ .tokens = emitted.items[start..] });
                 stats.rounds += 1;
                 stats.drafted += landed - 1;

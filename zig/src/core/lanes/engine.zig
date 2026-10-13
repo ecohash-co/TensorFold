@@ -12,6 +12,7 @@ const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const fill = @import("fill.zig");
 const trail = @import("trail.zig");
+const logprobs = @import("logprobs.zig");
 const Stream = sm.Stream;
 const Feed = be.Feed;
 const Plan = win.Plan;
@@ -79,6 +80,7 @@ pub const Engine = struct {
     pub fn addStream(e: *Engine, s: *Stream) !void {
         _ = e.arena.reset(.retain_capacity);
         try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+        s.first_row = null; // a backend with logprobs sets it from the prompt's last row
         e.backend.prefill(s) catch |err| {
             if (err == error.Cancelled) e.backend.release(s); // the host finishes a cancelled stream without the core
             return err;
@@ -88,6 +90,7 @@ pub const Engine = struct {
             return error.Cancelled;
         }
         s.context.shrinkRetainingCapacity(s.prompt_len);
+        s.scored.clearRetainingCapacity();
         s.pending = null;
         s.cache_len = s.prompt_len;
         const position: u64 = s.prompt_len;
@@ -111,7 +114,7 @@ pub const Engine = struct {
             const first = if (feed == .handle) value else try e.backend.read(drawn);
             try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) });
         }
-        _ = try s.commit(e.gpa, &.{value});
+        if (try s.commit(e.gpa, &.{value}) == 1) if (s.first_row) |*r| s.scoreLast(&.{r});
         s.pending = value;
         try trail.resolve(e);
         if (s.finished) {
@@ -239,11 +242,11 @@ pub const Engine = struct {
         const early = e.cfg.family_mtp and s.drafts and plan.kind != .forced and e.cfg.speculate_early and plan.parents == null;
         const windows = [_]be.Window{try win.build(e, plan, early)};
         const rows = windows[0].rows();
-        var out = [_]be.Verified{.{ .sampled = try a.alloc(u32, rows), .drafts = try a.alloc(u32, rows - 1) }};
+        var out = [_]be.Verified{.{ .sampled = try a.alloc(u32, rows), .drafts = try a.alloc(u32, rows - 1), .lp = try rowReports(a, s, rows) }};
         try e.backend.verify(&windows, &out);
         const tokens = try win.tokens(e, windows[0], out[0]);
         const parents = try win.rowParents(e, windows[0]);
-        const o = try e.conclude(s, plan, out[0].sampled, tokens, parents, windows[0].positions);
+        const o = try e.conclude(s, plan, out[0].sampled, tokens, parents, windows[0].positions, reported(out[0]));
         if (o.path.len < rows or plan.parents != null) try e.backend.keep(&windows, &.{o.path});
         const held_levels = s.held_levels;
         if (e.cfg.family_mtp and s.drafts) {
@@ -292,7 +295,7 @@ pub const Engine = struct {
         var total: u64 = 0;
         for (plans, windows, out) |p, *w, *o| {
             w.* = try win.build(e, p, false);
-            o.* = .{ .sampled = try a.alloc(u32, w.rows()), .drafts = try a.alloc(u32, w.rows() - 1) };
+            o.* = .{ .sampled = try a.alloc(u32, w.rows()), .drafts = try a.alloc(u32, w.rows() - 1), .lp = try rowReports(a, p.stream, w.rows()) };
             total += w.rows();
         }
         try e.backend.verify(windows, out);
@@ -300,7 +303,7 @@ pub const Engine = struct {
         const paths = try a.alloc([]const u32, plans.len);
         for (plans, windows, out, outcomes, paths) |p, w, o, *oc, *path| {
             const tokens = try win.tokens(e, w, o);
-            oc.* = try e.conclude(p.stream, p, o.sampled, tokens, try win.rowParents(e, w), w.positions);
+            oc.* = try e.conclude(p.stream, p, o.sampled, tokens, try win.rowParents(e, w), w.positions, reported(o));
             path.* = oc.path;
             const rows: u32 = @intCast(w.rows());
             p.stream.min_rows = if (p.stream.min_rows == 0) rows else @min(p.stream.min_rows, rows);
@@ -333,8 +336,20 @@ pub const Engine = struct {
         try e.rule.observeOverhead(@intCast(plans.len), total, ms);
     }
 
+    /// A window's row reports for the backend to fill when its stream asked for logprobs; null (no work) otherwise.
+    fn rowReports(a: Allocator, s: *const Stream, rows: usize) !?[]logprobs.Row {
+        return if (s.logprobs != null) try a.alloc(logprobs.Row, rows) else null;
+    }
+
+    /// The row reports a backend filled, else null.
+    fn reported(o: be.Verified) ?[]const logprobs.Row {
+        return if (o.lp_set) o.lp else null;
+    }
+
     /// Commit the target-sampled path (after the thinking budget's cut); the kept rows and their following tokens.
-    fn conclude(e: *Engine, s: *Stream, p: Plan, sampled: []const u32, tokens: []const u32, parents: []const i32, positions: []const u64) !Outcome {
+    /// With row reports (`lp`), each committed token is scored from its row: committed[i] follows row path[i] (a kept
+    /// draft is the draw of the row before it; a forced token is read by the next row, the last one popped after it).
+    fn conclude(e: *Engine, s: *Stream, p: Plan, sampled: []const u32, tokens: []const u32, parents: []const i32, positions: []const u64, lp: ?[]const logprobs.Row) !Outcome {
         const a = e.arena.allocator();
         const rows = tokens.len;
         var path: []u32 = undefined;
@@ -396,6 +411,11 @@ pub const Engine = struct {
         }
         s.rounds += 1;
         const landed = try s.commit(e.gpa, committed.items);
+        if (lp) |reports| if (landed > 0) {
+            const refs = try a.alloc(?*const logprobs.Row, landed);
+            for (refs, path[0..landed]) |*r, row| r.* = &reports[row];
+            s.scoreLast(refs);
+        };
         const got = committed.items[0..landed];
         if (s.finished and got.len < path.len) path = path[0 .. got.len + 1];
         const keep = path.len;

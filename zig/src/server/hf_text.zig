@@ -201,6 +201,7 @@ pub const HfText = struct {
             .render = renderFn,
             .template_source = sourceFn,
             .special = specialFn,
+            .token_bytes = tokenBytesFn,
         } };
     }
 
@@ -232,6 +233,10 @@ pub const HfText = struct {
     fn tokenStringFn(ctx: *anyopaque, a: Allocator, id: u32) Allocator.Error![]u8 {
         const piece = self(ctx).tok.id_to_token.get(id) orelse return a.dupe(u8, "");
         return a.dupe(u8, piece);
+    }
+
+    fn tokenBytesFn(ctx: *anyopaque, a: Allocator, id: u32) Allocator.Error![]u8 {
+        return self(ctx).tok.tokenBytes(a, id);
     }
 
     fn vocabFn(ctx: *anyopaque) u32 {

@@ -209,6 +209,7 @@ pub const LaneHost = struct {
     fn send(h: *LaneHost, job: *Job) void {
         const emitted = job.stream.emitted();
         if (emitted.len > job.delivered) {
+            if (job.stream.logprobs != null) emit(job, .{ .logprobs = job.stream.scored.items[job.delivered..emitted.len] });
             emit(job, .{ .tokens = emitted[job.delivered..] });
             h.noteDecoded(emitted.len - job.delivered);
             job.delivered = emitted.len;
@@ -348,6 +349,8 @@ pub const LaneHost = struct {
             .chunks = r.chunks,
             .reuse = reuse,
             .images = r.images,
+            .logprobs = r.logprobs,
+            .force = r.force,
         }) catch {
             job.proposer.deinit();
             return h.drop(job, "out of memory");
@@ -394,7 +397,7 @@ pub const LaneHost = struct {
     fn loneFits(h: *LaneHost, job: *Job) bool {
         const r = job.request;
         const lone = h.lone orelse return false;
-        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null) return false;
+        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.logprobs != null or r.force.len > 0) return false;
         h.lock();
         defer h.unlock();
         return h.admitted.items.len == 1 and h.queued.items.len == 0 and h.cancels.items.len == 0 and h.core.activeCount() == 0;

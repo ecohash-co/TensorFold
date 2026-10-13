@@ -96,6 +96,8 @@ pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = 2048;
 /// The served lane's reasoning effort numbers (text.zig): the server passes each name and the template hears its number.
 pub const efforts = @import("text.zig").efforts;
+/// The lanes backend reports logprobs and forced replies (lanes.zig: rank 0's host reduces the rows that ask).
+pub const reports_logprobs = true;
 
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
 

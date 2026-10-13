@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const Proposer = @import("proposer.zig").Proposer;
 const Sampling = @import("sampling.zig").Sampling;
 const State = @import("depth.zig").State;
+const logprobs = @import("logprobs.zig");
 
 pub const Reason = enum {
     none,
@@ -136,6 +137,12 @@ pub const Spec = struct {
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     reuse: Reuse = .{},
     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
+    /// Report each committed token's logprob and this many of the row's best (0..logprobs.max_top); null: none (the
+    /// rounds do no extra work).
+    logprobs: ?u8 = null,
+    /// The reply's first tokens, committed in place of the draws (teacher forcing: each still reports its logprob
+    /// under the model's distribution at its row); the caller's until the stream is released.
+    force: []const u32 = &.{},
 };
 
 pub const Stream = struct {
@@ -190,6 +197,9 @@ pub const Stream = struct {
     served: ?u64 = null,
     granted: ?u32 = null,
     copy_width: ?u32 = null,
+    logprobs: ?u8 = null, // Spec.logprobs
+    scored: std.ArrayList(logprobs.Token) = .empty, // with logprobs: one report per emitted token, in order
+    first_row: ?logprobs.Row = null, // with logprobs: the prompt's last row, as the backend's prefill drew from it
 
     pub fn init(gpa: Allocator, spec: Spec) !Stream {
         var s: Stream = .{
@@ -210,14 +220,18 @@ pub const Stream = struct {
             .chunks = spec.chunks,
             .reuse = spec.reuse,
             .images = spec.images,
+            .logprobs = if (spec.logprobs) |k| @min(k, logprobs.max_top) else null,
         };
+        errdefer s.context.deinit(gpa);
         try s.context.appendSlice(gpa, spec.prompt);
+        try s.force.appendSlice(gpa, spec.force);
         return s;
     }
 
     pub fn deinit(s: *Stream, gpa: Allocator) void {
         s.context.deinit(gpa);
         s.force.deinit(gpa);
+        s.scored.deinit(gpa);
         s.dropRoundState(gpa);
     }
 
@@ -331,7 +345,22 @@ pub const Stream = struct {
                 s.reason = .length;
             }
         }
+        // with logprobs, every emitted token has its report (unscored until its round scores it: scoreLast)
+        if (s.logprobs != null) while (s.scored.items.len < s.emitted().len) {
+            try s.scored.append(gpa, .unscored(s.emitted()[s.scored.items.len]));
+        };
         return landed;
+    }
+
+    /// Score the last `rows.len` emitted tokens (those a round just committed), each from the row that drew it
+    /// (null: it stays unscored). A no-op without logprobs.
+    pub fn scoreLast(s: *Stream, rows: []const ?*const logprobs.Row) void {
+        if (s.logprobs == null) return;
+        const n = s.scored.items.len;
+        std.debug.assert(rows.len <= n);
+        for (rows, s.scored.items[n - rows.len ..]) |r, *t| {
+            if (r) |row| t.* = row.forToken(t.token);
+        }
     }
 
     fn stopped(s: *const Stream) bool {

@@ -34,12 +34,32 @@ pub const Input = struct {
     token_ids: bool = false,
     /// The image parts' bytes in prompt order (their placeholders in the messages' text), for an engine with vision.
     images: []const []const u8 = &.{},
+    /// ``logprobs: true`` (and its ``top_logprobs``), checked against the engine (fields.probabilityOptions).
+    logprobs: ?fields_mod.Logprobs = null,
+    /// ``forced_tokens``: the reply's first tokens as given (teacher forcing), checked (fields.forcedTokens).
+    force: []const u32 = &.{},
+};
+
+/// A reply's token reports (with logprobs), one per generated token in order, as they land; ``sent``: how many a
+/// stream has carried out so far (its route's own count).
+pub const Scored = struct {
+    items: std.ArrayList(api.TokenLogprob) = .empty,
+    sent: usize = 0,
+
+    /// The reports not yet sent, now marked sent.
+    pub fn take(s: *Scored) []const api.TokenLogprob {
+        const fresh = s.items.items[s.sent..];
+        s.sent = s.items.items.len;
+        return fresh;
+    }
 };
 
 /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
 pub const Sink = struct {
     ctx: *anyopaque,
     call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!void,
+    /// With logprobs: where the reply's token reports land as their tokens do, before the deltas they make are sent.
+    scored: ?*Scored = null,
 };
 
 pub const Reply = struct {
@@ -54,6 +74,8 @@ pub const Reply = struct {
     reasoning_tokens: usize,
     runtime: Value,
     speculative: Value,
+    /// With logprobs: each generated token's report, in order (the reply's every token, its reasoning and EOS too).
+    scored: ?[]const api.TokenLogprob = null,
 };
 
 pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
@@ -65,6 +87,7 @@ const Mailbox = struct {
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     tokens: std.ArrayList(u32) = .empty,
+    scored: std.ArrayList(api.TokenLogprob) = .empty, // with logprobs: one report per token, as `tokens`
     chunks: std.ArrayList(usize) = .empty, // where each round's tokens end
     cached: ?u32 = null,
     prefilled_ns: ?i96 = null,
@@ -89,6 +112,7 @@ const Mailbox = struct {
                 m.tokens.appendSlice(m.gpa, t) catch {};
                 m.chunks.append(m.gpa, m.tokens.items.len) catch {};
             },
+            .logprobs => |l| m.scored.appendSlice(m.gpa, l) catch {},
             .finished => |f| {
                 m.finished = true;
                 m.reason = f.reason;
@@ -104,6 +128,7 @@ const Mailbox = struct {
 
     fn deinit(m: *Mailbox) void {
         m.tokens.deinit(m.gpa);
+        m.scored.deinit(m.gpa);
         m.chunks.deinit(m.gpa);
         m.gpa.free(m.widths);
         m.gpa.free(m.raised);
@@ -186,6 +211,8 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         // a cut just before the conversation's own text: fresh sessions resume their whole harness
         .chunks = try chunk_plan.withCut(a, try srv.chunks.starts(a, rendered.ids), if (srv.chunks.step > 0) @intCast(@max(system_len, 1) - 1) else 0, rendered.ids.len, srv.chunks.min_chunk),
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
+        .logprobs = if (input.logprobs) |l| l.top else null,
+        .force = input.force,
     };
     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
     if (thinking) {
@@ -227,6 +254,8 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     if (stops_opt.strings.len > 0) request.stop = .{ .ctx = &stop_hook, .check = StopHook.check };
     var box: Mailbox = .{ .io = io, .gpa = srv.gpa };
     defer box.deinit();
+    var own_scored: Scored = .{};
+    const scored: ?*Scored = if (request.logprobs == null) null else if (sink) |s| s.scored orelse &own_scored else &own_scored;
     const id = srv.next_id.fetchAdd(1, .monotonic);
     const submitted = nowNs(io);
     if (srv.keepalive) |k| k.begin(); // the GPU is busy: the idle ticker holds its commits
@@ -237,7 +266,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     };
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids, .scored = scored };
     defer srv.noteRequest(prepared.prompt_len, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
@@ -316,6 +345,7 @@ const Generation = struct {
     calls: ?tool_stream.Streamer = null,
     collected: std.ArrayList(u32) = .empty,
     token_ids: bool = false, // the request asked for its ids back (Input.token_ids)
+    scored: ?*Scored = null, // with logprobs: the landed tokens' reports, in step with `collected`
     visible: reply_text.Incremental = .{},
     hidden: std.ArrayList(u8) = .empty, // reused for the answer without its call blocks
     streamed: Shown = .{}, // what content streamed, kept apart from the decode buffer that grows under slices
@@ -349,12 +379,14 @@ const Generation = struct {
         return false;
     }
 
-    /// Commits a round's tokens as ``LaneStream.commit`` would, then streams what they add.
-    fn commit(g: *Generation, chunk: []const u32) Failure!void {
+    /// Commits a round's tokens as ``LaneStream.commit`` would, then streams what they add; with logprobs each landed
+    /// token's report (`reports`, one per token of the chunk; an engine that sent none leaves it unscored) goes first.
+    fn commit(g: *Generation, chunk: []const u32, reports: []const api.TokenLogprob) Failure!void {
         var landed: usize = 0;
-        for (chunk) |t| {
+        for (chunk, 0..) |t, i| {
             if (g.reason != null) break;
             try g.collected.append(g.a, t);
+            if (g.scored) |sc| try sc.items.append(g.a, if (i < reports.len and reports[i].token == t) reports[i] else .unscored(t));
             landed += 1;
             if (g.eos(t)) {
                 g.reason = "stop";
@@ -434,11 +466,13 @@ const Generation = struct {
         while (true) {
             m.mutex.lockUncancelable(m.io);
             var chunk: ?[]u32 = null;
+            var reports: []const api.TokenLogprob = &.{};
             var ended = false;
             if (g.chunk_index < m.chunks.items.len) {
                 const end = m.chunks.items[g.chunk_index];
                 g.chunk_index += 1;
                 chunk = g.a.dupe(u32, m.tokens.items[g.consumed..end]) catch null;
+                if (g.scored != null and m.scored.items.len >= end) reports = g.a.dupe(api.TokenLogprob, m.scored.items[g.consumed..end]) catch &.{};
                 g.consumed = end;
             } else if (m.finished) {
                 ended = true;
@@ -455,7 +489,7 @@ const Generation = struct {
                 return error.Cancelled;
             }
             const tokens = chunk orelse continue;
-            if (g.reason == null) try g.commit(tokens);
+            if (g.reason == null) try g.commit(tokens, reports);
         }
     }
 
@@ -556,6 +590,7 @@ const Generation = struct {
             .reasoning_tokens = reply_text.reasoningCount(g.collected.items, think_end),
             .runtime = .{ .object = runtime },
             .speculative = .{ .object = spec },
+            .scored = if (g.scored) |sc| sc.items.items else null,
         };
         if (std.mem.eql(u8, reason, "length") and thinking and reply_text.pyStrip(content).len == 0)
             log.line("warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {{\"enable_thinking\": false}} (server: --no-thinking)", .{});

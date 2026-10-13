@@ -18,9 +18,14 @@ const Case = struct {
 };
 
 fn model() !Config {
+    return modelWith(true);
+}
+
+/// model() with one-token rounds a step ahead or not (a backend without `queue`, as DeepSeek-V4.1's lanes).
+fn modelWith(gpu_tokens: bool) !Config {
     var costs: [16]@import("config.zig").Cost = undefined;
     for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 0.8 * @as(f64, @floatFromInt(w)) };
-    return Config.init(gpa, .{ .exact_width = 16, .gpu_tokens = true, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .hidden_rows = true, .batch_rows = 32, .max_streams = 8, .draft_streams = true }, 16, 15);
+    return Config.init(gpa, .{ .exact_width = 16, .gpu_tokens = gpu_tokens, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .hidden_rows = true, .batch_rows = 32, .max_streams = 8, .draft_streams = true }, 16, 15);
 }
 
 /// Every case's emitted tokens, the cases admitted together and stepped until done.
@@ -180,4 +185,86 @@ test "a cycle in the answer does not refire or reclose" {
     var close_count: usize = 0;
     for (plain[0].emitted) |token| close_count += @intFromBool(token == 90);
     try std.testing.expectEqual(@as(usize, 1), close_count);
+}
+
+test "logprobs: each emitted token scored from the row that drew it, forced ones too; the tokens unchanged" {
+    // the verify rounds score; one-token rounds queued a step ahead (pipelined) leave their tokens unscored
+    var cfg = try modelWith(false);
+    defer cfg.deinit(gpa);
+    const force = [_]u32{ 50, 51, 52, 53, 54, 55, 56, 57, 58 }; // teacher-forced: more than a window's rows
+    for ([_]bool{ true, false }) |drafts| for ([_][]const u32{ &.{}, &force }) |forced| {
+        var emitted: [2][]u32 = undefined;
+        for ([_]?u8{ null, 3 }, 0..) |lp, i| {
+            var target: fake.Fake = .{ .gpa = gpa, .reports = true };
+            defer target.deinit();
+            var clock: fake.FixedClock = .{};
+            var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+            defer engine.deinit();
+            var p = try SuffixLookup.init(gpa, .{ .min_match = 4 });
+            defer p.deinit();
+            var s = try sm.Stream.init(gpa, .{ .id = "lp", .prompt = &p2, .max_new = 40, .eos = &.{96}, .drafts = drafts, .proposer = p.proposer(), .logprobs = lp, .force = forced });
+            defer s.deinit(gpa);
+            try engine.addStream(&s);
+            while (engine.activeCount() > 0) try engine.step();
+            emitted[i] = try gpa.dupe(u32, s.emitted());
+            if (lp == null) {
+                try std.testing.expectEqual(@as(usize, 0), s.scored.items.len);
+                continue;
+            }
+            try std.testing.expectEqual(s.emitted().len, s.scored.items.len);
+            try std.testing.expectEqualSlices(u32, forced, s.emitted()[0..forced.len]);
+            var history: std.ArrayList(u32) = .empty;
+            defer history.deinit(gpa);
+            try history.appendSlice(gpa, &p2);
+            for (s.emitted(), s.scored.items) |t, rep| {
+                // the row that drew at this position: the fake's draw after the history
+                const drew = fake.next(history.items, null, history.items.len);
+                const want = fake.reportFor(drew, 3, t);
+                try std.testing.expectEqual(t, rep.token);
+                try std.testing.expect(rep.scored());
+                try std.testing.expectEqual(want.forToken(t).logprob, rep.logprob);
+                try std.testing.expectEqualSlices(u32, want.ids[0..3], rep.top());
+                if (t == drew) try std.testing.expectEqual(rep.lps[0], rep.logprob);
+                try history.append(gpa, t);
+            }
+        }
+        defer for (emitted) |e| gpa.free(e);
+        try std.testing.expectEqualSlices(u32, emitted[0], emitted[1]);
+    };
+}
+
+test "logprobs in shared rounds: the asking stream's reports are its own rows', the other stream does no extra work" {
+    var cfg = try modelWith(false);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa, .reports = true };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer engine.deinit();
+    var pa = try SuffixLookup.init(gpa, .{ .min_match = 4 });
+    defer pa.deinit();
+    var pb = try SuffixLookup.init(gpa, .{ .min_match = 4 });
+    defer pb.deinit();
+    var a = try sm.Stream.init(gpa, .{ .id = "a", .prompt = &p1, .max_new = 30, .eos = &.{96}, .proposer = pa.proposer(), .logprobs = 2, .force = &.{ 60, 61, 62 } });
+    defer a.deinit(gpa);
+    var b = try sm.Stream.init(gpa, .{ .id = "b", .prompt = &p2, .max_new = 30, .eos = &.{96}, .proposer = pb.proposer() });
+    defer b.deinit(gpa);
+    try engine.addStream(&a);
+    try engine.addStream(&b);
+    while (engine.activeCount() > 0) try engine.step();
+    try std.testing.expectEqual(@as(usize, 0), b.scored.items.len);
+    try std.testing.expectEqual(a.emitted().len, a.scored.items.len);
+    var history: std.ArrayList(u32) = .empty;
+    defer history.deinit(gpa);
+    try history.appendSlice(gpa, &p1);
+    for (a.emitted(), a.scored.items) |t, rep| {
+        const want = fake.reportFor(fake.next(history.items, null, history.items.len), 2, t);
+        try std.testing.expect(rep.scored());
+        try std.testing.expectEqual(want.forToken(t).logprob, rep.logprob);
+        try history.append(gpa, t);
+    }
+    // the other stream's reply is the one it makes alone
+    const alone = try run(&.{.{ .prompt = &p2, .max_new = 30 }});
+    defer free(alone);
+    try std.testing.expectEqualSlices(u32, alone[0], b.emitted());
 }

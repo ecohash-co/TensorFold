@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !u8 {
     const scripts_bytes = try std.Io.Dir.cwd().readFileAlloc(io, scripts_path, a, .limited(4 << 20));
     const scripts = try std.json.parseFromSliceLeaky(std.json.Value, a, scripts_bytes, .{});
     const context: u32 = if (init.environ_map.get("TF_FAKE_CONTEXT")) |c| try std.fmt.parseInt(u32, c, 10) else 0;
-    var engine: ScriptEngine = .{ .gpa = gpa, .io = io, .text = text, .scripts = scripts, .info_ = .{ .lanes = server.cli.parallel(args.parallel) orelse 8, .context_window = context, .call_gates = true } };
+    var engine: ScriptEngine = .{ .gpa = gpa, .io = io, .text = text, .scripts = scripts, .info_ = .{ .lanes = server.cli.parallel(args.parallel) orelse 8, .context_window = context, .call_gates = true, .logprobs = init.environ_map.get("TF_FAKE_LOGPROBS") != null } };
     return server.serve.run(gpa, io, args, .{
         .engine = engine.engine(),
         .text = text,

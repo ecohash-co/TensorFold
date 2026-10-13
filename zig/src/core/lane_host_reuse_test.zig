@@ -53,6 +53,7 @@ test "a lane host resumes a conversation from its kept prompt state and reports 
                 .prefilled => |c| b.cached = c,
                 .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
                 .finished => |f| b.done = f.reason,
+                .logprobs => {},
             }
         }
         fn wait(b: *@This()) Reason {
@@ -153,6 +154,7 @@ test "a turn's mark evicting the state it resumed from: the hit is reported firs
                 .prefilled => |c| b.cached = c,
                 .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
                 .finished => |f| b.done = f.reason,
+                .logprobs => {},
             }
         }
         fn wait(b: *@This()) Reason {

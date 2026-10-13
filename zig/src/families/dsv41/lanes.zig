@@ -12,13 +12,18 @@
 //! positional, so keep only checks that a path is a prefix. Rank 0 runs the core; before each primitive it sends rank
 //! 1 the primitive's inputs over the ranks' link, and rank 1 (follow) runs the same primitive: both ranks issue the
 //! same kernels and collectives in the same order. The drafted reply is the serial one: every row is drawn with its
-//! stream's key at its own position, whatever the round's composition.
+//! stream's key at its own position, whatever the round's composition. A stream that asks for logprobs
+//! (lanes.logprobs) has each of its rows reduced on rank 0's host from the round's gathered [R, vocab] fp32 logits (the
+//! copy sampled rounds take anyway): its logsumexp over the whole vocabulary, its best tokens, the drawn token's and the
+//! next row's (or next forced) token's logprob. The draws are untouched (a greedy round's tokens stay the device's
+//! argmax), rank 1 does nothing new, and a round no stream asks for runs exactly as before.
 const std = @import("std");
 const lanes = @import("lanes");
 const model = @import("model.zig");
 const round = @import("round.zig");
 const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
+const logprobs = lanes.logprobs;
 const link = @import("link.zig");
 const refusal = @import("refusal.zig");
 const cuda = @import("cuda");
@@ -634,6 +639,8 @@ pub const Lanes = struct {
             std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
         }
         const token = try draw(logits, len, s.sampling);
+        // the prompt's last row's report: the draw's distribution, and the first forced token's (teacher forcing)
+        if (s.logprobs) |k| s.first_row = logprobs.row(logits, k, token, if (s.force.items.len > 0) s.force.items[0] else null);
         self.streams.getPtr(s).?.first = self.take(token);
     }
 
@@ -694,15 +701,18 @@ pub const Lanes = struct {
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         m.verify(rows, self.built.absorb[0..windows.len]) catch |err| return self.refusing(err);
         const t2 = m.now();
-        // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
+        // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws. A stream asking
+        // for logprobs also takes the logits to the host (after the argmax, which stays the greedy rows' tokens)
         var greedy = true;
-        for (windows) |w| {
+        var scored = false;
+        for (windows, out) |w, o| {
             if (w.stream.sampling) |sm| if (sm.temperature > 0) {
                 greedy = false;
             };
+            if (o.lp != null and w.stream.logprobs != null) scored = true;
         }
         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
-        const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
+        const logits: []const f32 = if (greedy and !scored) &.{} else try m.roundLogits(rows.ids.len);
         const t3 = m.now();
         defer if (self.prof) |*p| {
             p.send += t1 - t0;
@@ -718,6 +728,15 @@ pub const Lanes = struct {
         for (windows, out, 0..) |w, *o, k| {
             const row0 = self.built.wins[k].row;
             for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
+            if (o.lp) |lp| if (w.stream.logprobs) |top| {
+                // each row's report; its successor reads the next row's id, the last row the stream's next forced token
+                const win_ids = wins[k].ids;
+                for (0..w.rows()) |r| {
+                    const after: ?u32 = if (r + 1 < win_ids.len) @intCast(win_ids[r + 1]) else if (w.stream.force.items.len > 0) w.stream.force.items[0] else null;
+                    lp[r] = logprobs.row(logits[(row0 + r) * V ..][0..V], top, o.sampled[r], after);
+                }
+                o.lp_set = true;
+            };
             const l = self.streams.getPtr(w.stream).?;
             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);

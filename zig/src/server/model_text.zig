@@ -38,6 +38,8 @@ pub const Text = struct {
         template_source: *const fn (ctx: *anyopaque) []const u8,
         /// Whether an id is a special token (an added token flagged special); null: none are known.
         special: ?*const fn (ctx: *anyopaque, id: u32) bool = null,
+        /// A token's raw bytes (a byte-level piece's own, a character it splits left partial); null: its decode's.
+        token_bytes: ?*const fn (ctx: *anyopaque, a: Allocator, id: u32) Allocator.Error![]u8 = null,
     };
 
     pub fn encode(t: Text, a: Allocator, text: []const u8, add_special: bool) Error![]u32 {
@@ -76,6 +78,12 @@ pub const Text = struct {
 
     pub fn templateSource(t: Text) []const u8 {
         return t.vtable.template_source(t.ctx);
+    }
+
+    /// A token's raw bytes, for logprobs' ``bytes`` (the decode of the token alone where the text has no byte map).
+    pub fn tokenBytes(t: Text, a: Allocator, id: u32) Allocator.Error![]u8 {
+        const f = t.vtable.token_bytes orelse return t.decode(a, &.{id});
+        return f(t.ctx, a, id);
     }
 
     pub fn isSpecial(t: Text, id: u32) bool {

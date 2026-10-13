@@ -273,17 +273,43 @@ pub fn effortLevels(a: Allocator, template: []const u8) Allocator.Error![]const 
     return found.items;
 }
 
-/// ``probability_options``: n must be 1, and logprobs are refused (no engine reports them yet).
-pub fn probabilityOptions(cx: *Cx, body: Value) errors.Refused!void {
+/// What a reply reports per token (OpenAI's ``logprobs: true`` with ``top_logprobs``): each generated token's logprob
+/// and the ``top`` best of its row (0..20).
+pub const Logprobs = struct { top: u8 = 0 };
+
+/// ``probability_options``: n must be 1; logprobs a boolean, top_logprobs 0..20 and only with logprobs: true. An
+/// engine that reports them (``reports``, its Info.logprobs) gets the request's Logprobs (null: not asked); any other
+/// refuses ``logprobs: true`` as before.
+pub fn probabilityOptions(cx: *Cx, body: Value, reports: bool) errors.Refused!?Logprobs {
     if (body.field("n")) |n| if (n != .int or !std.mem.eql(u8, n.int, "1")) return cx.refuse("n must be 1; multiple choices are not supported");
     const enabled = body.field("logprobs");
     if (enabled) |e| if (e != .bool) return cx.refuse("logprobs must be a boolean or null");
-    if (body.field("top_logprobs")) |top| {
-        const n = top.int64();
+    var top: u8 = 0;
+    if (body.field("top_logprobs")) |t| {
+        const n = t.int64();
         if (n == null or n.? < 0 or n.? > 20) return cx.refuse("top_logprobs must be an integer between 0 and 20, or null");
         if (enabled == null or !enabled.?.bool) return cx.refuse("top_logprobs requires logprobs: true");
+        top = @intCast(n.?);
     }
-    if (enabled != null and enabled.?.bool) return cx.refuse("logprobs are not supported by this model or backend");
+    if (enabled == null or !enabled.?.bool) return null;
+    if (!reports) return cx.refuse("logprobs are not supported by this model or backend");
+    return .{ .top = top };
+}
+
+/// ``forced_tokens`` (ours): the reply's first tokens as given instead of drawn (teacher forcing; with logprobs each
+/// is scored under the model's distribution at its row). A nonempty list of ids below ``vocab``; null or absent: none.
+/// An engine that does not force (``reports`` false) refuses it.
+pub fn forcedTokens(cx: *Cx, body: Value, vocab: u32, reports: bool) errors.Refused![]const u32 {
+    const list = body.field("forced_tokens") orelse return &.{};
+    if (!reports) return cx.refuse("forced_tokens are not supported by this model or backend");
+    if (list != .array or list.array.len == 0) return cx.refuse("forced_tokens must be a nonempty list of token ids, or null");
+    const out = try cx.a.alloc(u32, list.array.len);
+    for (list.array, out) |t, *slot| {
+        const n = t.int64();
+        if (n == null or n.? < 0 or n.? >= vocab) return cx.fail(.request, "forced_tokens must be token ids in the valid range 0 to {d}", .{@as(i64, vocab) - 1});
+        slot.* = @intCast(n.?);
+    }
+    return out;
 }
 
 const media = [_][]const u8{ "image", "images", "image_url", "input_image", "audio", "input_audio", "video", "video_url" };
@@ -312,4 +338,51 @@ test "efforts and numbers" {
     defer arena.deinit();
     try std.testing.expectEqualStrings("-12", (try pyIntText(arena.allocator(), " -0_12 ")).?);
     try std.testing.expect(try pyIntText(arena.allocator(), "8.0") == null);
+}
+
+test "logprobs options: asked, refused where the engine reports none, and their checks" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const P = struct {
+        fn body(al: Allocator, text: []const u8) !Value {
+            return (try json.parse(al, text)).ok;
+        }
+    };
+    var cx: Cx = .{ .a = a };
+    try std.testing.expectEqual(@as(?Logprobs, null), try probabilityOptions(&cx, try P.body(a, "{}"), true));
+    try std.testing.expectEqual(@as(?Logprobs, null), try probabilityOptions(&cx, try P.body(a, "{\"logprobs\": false}"), false));
+    try std.testing.expectEqual(@as(?Logprobs, null), try probabilityOptions(&cx, try P.body(a, "{\"logprobs\": null, \"top_logprobs\": null}"), true));
+    try std.testing.expectEqual(@as(?Logprobs, .{ .top = 0 }), try probabilityOptions(&cx, try P.body(a, "{\"logprobs\": true}"), true));
+    try std.testing.expectEqual(@as(?Logprobs, .{ .top = 20 }), try probabilityOptions(&cx, try P.body(a, "{\"logprobs\": true, \"top_logprobs\": 20, \"n\": 1}"), true));
+    const refused = [_]struct { []const u8, bool, []const u8 }{
+        .{ "{\"logprobs\": true}", false, "logprobs are not supported by this model or backend" },
+        .{ "{\"logprobs\": 1}", true, "logprobs must be a boolean or null" },
+        .{ "{\"logprobs\": true, \"top_logprobs\": 21}", true, "top_logprobs must be an integer between 0 and 20, or null" },
+        .{ "{\"logprobs\": true, \"top_logprobs\": -1}", true, "top_logprobs must be an integer between 0 and 20, or null" },
+        .{ "{\"logprobs\": true, \"top_logprobs\": 2.5}", true, "top_logprobs must be an integer between 0 and 20, or null" },
+        .{ "{\"top_logprobs\": 3}", true, "top_logprobs requires logprobs: true" },
+        .{ "{\"logprobs\": false, \"top_logprobs\": 3}", true, "top_logprobs requires logprobs: true" },
+        .{ "{\"logprobs\": true, \"n\": 2}", true, "n must be 1; multiple choices are not supported" },
+    };
+    for (refused) |r| {
+        try std.testing.expectError(error.Refused, probabilityOptions(&cx, try P.body(a, r[0]), r[1]));
+        try std.testing.expectEqualStrings(r[2], cx.message);
+    }
+}
+
+test "forced tokens: ids in range, refused where the engine forces none" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cx: Cx = .{ .a = a };
+    try std.testing.expectEqual(@as(usize, 0), (try forcedTokens(&cx, (try json.parse(a, "{}")).ok, 100, false)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try forcedTokens(&cx, (try json.parse(a, "{\"forced_tokens\": null}")).ok, 100, true)).len);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 7, 99 }, try forcedTokens(&cx, (try json.parse(a, "{\"forced_tokens\": [0, 7, 99]}")).ok, 100, true));
+    try std.testing.expectError(error.Refused, forcedTokens(&cx, (try json.parse(a, "{\"forced_tokens\": [1]}")).ok, 100, false));
+    try std.testing.expectEqualStrings("forced_tokens are not supported by this model or backend", cx.message);
+    try std.testing.expectError(error.Refused, forcedTokens(&cx, (try json.parse(a, "{\"forced_tokens\": [100]}")).ok, 100, true));
+    try std.testing.expectEqualStrings("forced_tokens must be token ids in the valid range 0 to 99", cx.message);
+    try std.testing.expectError(error.Refused, forcedTokens(&cx, (try json.parse(a, "{\"forced_tokens\": []}")).ok, 100, true));
+    try std.testing.expectError(error.Refused, forcedTokens(&cx, (try json.parse(a, "{\"forced_tokens\": \"12\"}")).ok, 100, true));
 }

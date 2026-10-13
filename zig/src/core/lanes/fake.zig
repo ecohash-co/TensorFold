@@ -6,8 +6,22 @@ const Stream = @import("stream.zig").Stream;
 const Sampling = @import("sampling.zig").Sampling;
 const keyBits = @import("sampling.zig").keyBits;
 const accept = @import("accept.zig");
+const logprobs = @import("logprobs.zig");
 
 pub const vocab = 97;
+
+/// The fake's logits for a row that draws `token`: 0 at the token, a quarter less per id after it (cyclically).
+pub fn logitsFor(token: u32) [vocab]f32 {
+    var row: [vocab]f32 = undefined;
+    for (&row, 0..) |*v, j| v.* = -0.25 * @as(f32, @floatFromInt((j + vocab - token) % vocab));
+    return row;
+}
+
+/// The fake's report of a row that draws `token` (logitsFor's), its successor reading `after`.
+pub fn reportFor(token: u32, top: usize, after: ?u32) logprobs.Row {
+    const row = logitsFor(token);
+    return logprobs.row(&row, top, token, after);
+}
 
 /// The fake target's draw after `history` at `position` (keyed noise when sampled).
 pub fn next(history: []const u32, s: ?Sampling, position: u64) u32 {
@@ -40,6 +54,7 @@ pub const Fake = struct {
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     refuse_full: usize = 0, // prefill refuses this many times with error.ContextFull while another lane is live
+    reports: bool = false, // fill row reports (logitsFor's rows) for streams that ask for logprobs
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -144,7 +159,11 @@ pub const Fake = struct {
 
     fn first(ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64 {
         const x = self(ptr);
-        return x.draw(x.lane(s), s, position);
+        const h = try x.draw(x.lane(s), s, position);
+        if (x.reports) if (s.logprobs) |k| {
+            s.first_row = reportFor(x.drawn.items[h], k, if (s.force.items.len > 0) s.force.items[0] else null);
+        };
+        return h;
     }
 
     fn queue(ptr: *anyopaque, s: *Stream, feed: be.Feed, position: u64) anyerror!u64 {
@@ -161,7 +180,7 @@ pub const Fake = struct {
     fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const x = self(ptr);
         x.rounds += 1;
-        for (windows, out) |w, o| {
+        for (windows, out) |w, *o| {
             const l = x.lane(w.stream);
             l.base = l.history.items.len;
             l.rows.clearRetainingCapacity();
@@ -181,7 +200,13 @@ pub const Fake = struct {
                 try l.history.appendSlice(x.gpa, path.items);
                 if (w.positions[r] != l.history.items.len) return error.PositionMismatch;
                 o.sampled[r] = x.targetNext(l.history.items, w.stream.sampling, w.positions[r]);
+                if (x.reports) if (o.lp) |lp| {
+                    const rows = l.rows.items;
+                    const after: ?u32 = if (r + 1 < rows.len) rows[r + 1] else if (w.stream.force.items.len > 0) w.stream.force.items[0] else null;
+                    lp[r] = reportFor(o.sampled[r], w.stream.logprobs.?, after);
+                };
             }
+            if (x.reports and o.lp != null) o.lp_set = true;
             l.history.shrinkRetainingCapacity(l.base);
             try l.history.appendSlice(x.gpa, l.rows.items); // a chain keeps every row unless rolled back
         }

@@ -203,6 +203,24 @@ const char_bytes: [0x144]i16 = blk: {
     break :blk table;
 };
 
+/// A byte-level piece's raw bytes (ByteLevel's map, before any UTF-8 repair); a piece outside the map (an added
+/// token) as it is. Caller frees with `a`.
+pub fn byteLevelBytes(a: Allocator, token: []const u8) Allocator.Error![]u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(a);
+    var i: usize = 0;
+    while (i < token.len) {
+        const c = unicode.decodeAt(token, i);
+        if (c.cp >= char_bytes.len or char_bytes[c.cp] < 0) {
+            bytes.deinit(a);
+            return a.dupe(u8, token);
+        }
+        try bytes.append(a, @intCast(char_bytes[c.cp]));
+        i += c.len;
+    }
+    return bytes.toOwnedSlice(a);
+}
+
 const gpt2_pattern = "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
 
 fn scheme(v: Value) Error!Scheme {
@@ -365,6 +383,17 @@ pub const Decoder = union(enum) {
         return error.UnsupportedDecoder;
     }
 
+    /// Whether the chain maps byte-level pieces back to bytes (ByteLevel, alone or in a Sequence).
+    pub fn byteLevel(d: *const Decoder) bool {
+        return switch (d.*) {
+            .byte_level => true,
+            .sequence => |steps| for (steps) |*step| {
+                if (step.byteLevel()) break true;
+            } else false,
+            else => false,
+        };
+    }
+
     /// Runs the decoder chain and joins its output, like tokenizers' Decoder::decode.
     pub fn decode(d: *const Decoder, a: Allocator, ctx: *Context, tokens: []const []const u8) Error![]u8 {
         return std.mem.concat(a, u8, try d.chain(ctx, tokens));
@@ -499,4 +528,17 @@ test "split behaviors match tokenizers" {
         try std.testing.expectEqual(case[1].len, out.items.len);
         for (case[1], out.items) |want, got| try std.testing.expectEqualStrings(want, got.text);
     }
+}
+
+test "a byte-level piece's raw bytes: mapped bytes, a split character's bytes as they are, added tokens whole" {
+    const a = std.testing.allocator;
+    const space_a = try byteLevelBytes(a, "\u{120}a"); // "Ġa"
+    defer a.free(space_a);
+    try std.testing.expectEqualSlices(u8, " a", space_a);
+    const half = try byteLevelBytes(a, "\u{e2}\u{122}"); // "âĢ": 0xe2 0x80, the first two bytes of a three-byte character
+    defer a.free(half);
+    try std.testing.expectEqualSlices(u8, &.{ 0xe2, 0x80 }, half);
+    const added = try byteLevelBytes(a, "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>");
+    defer a.free(added);
+    try std.testing.expectEqualStrings("<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>", added);
 }

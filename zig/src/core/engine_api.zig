@@ -9,6 +9,12 @@ pub const Id = u64;
 /// One request's sampling (Python's exact_sampling.Sampling); a request without one decodes greedily.
 pub const Sampling = lanes.Sampling;
 
+/// A committed token's logprob and its row's best (lanes.logprobs.Token): the ``logprobs`` event's items.
+pub const TokenLogprob = lanes.logprobs.Token;
+
+/// The most top_logprobs a request may ask.
+pub const max_top_logprobs = lanes.logprobs.max_top;
+
 /// A prompt's reproducible seed (``seed_for``), for requests that name none.
 pub const seedFor = lanes.sampling.seedFor;
 
@@ -76,6 +82,12 @@ pub const Request = struct {
     structure: ?Structure = null,
     /// Stop a short exact cycle while the think block is open.
     loop_guard: bool = false,
+    /// Set only when ``Info.logprobs``: each committed token's logprob under the raw (temperature 1) logits of the row
+    /// that drew it, with that row's best ``logprobs`` tokens (0..max_top_logprobs), in ``logprobs`` events; null: none.
+    logprobs: ?u8 = null,
+    /// The reply's first tokens, committed in place of the draws (teacher forcing; with ``logprobs`` each is scored
+    /// under the model's distribution at its row). Empty: none.
+    force: []const u32 = &.{},
 };
 
 pub const Reason = enum { stop, length, cancelled, failed };
@@ -102,6 +114,9 @@ pub const Event = union(enum) {
     prefilled: u32,
     /// Tokens committed for this request, in order; valid only during the call.
     tokens: []const u32,
+    /// With ``Request.logprobs``: the reports of the tokens the next ``tokens`` event carries, one each, in order
+    /// (sent just before it); valid only during the call.
+    logprobs: []const TokenLogprob,
     /// The reply ended; nothing follows. ``message`` says why a failed reply failed.
     finished: struct { reason: Reason, stats: Stats = .{}, message: []const u8 = "" },
 };
@@ -127,6 +142,8 @@ pub const Info = struct {
     /// The engine observes loop_guard requests in its lane stream.
     loop_guard: bool = false,
     structures: bool = false,
+    /// The engine reports logprobs (Request.logprobs) and forced replies (Request.force); else the server refuses them.
+    logprobs: bool = false,
     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
     prefill_step: u32 = 0,
     /// A line the server prints once at startup (the engine's memory plan); empty: none.

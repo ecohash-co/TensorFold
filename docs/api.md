@@ -102,6 +102,16 @@ with thinking off, without tools, stop strings or structured output. Each visibl
 distribution at temperature 1, before temperature, top-k or top-p sampling filters, including when generation is
 greedy. Alternatives are tokenizer tokens and may include leading spaces; `bytes` preserves partial UTF-8 sequences.
 Unsupported backends, engines and request modes return HTTP 400 when probabilities are requested.
+The native Zig server with DeepSeek-V4.1 (`tensorfold-native`, the lanes backend) supports `logprobs: true` with
+`top_logprobs` 0 through 20 on `/v1/chat/completions` and `/v1/completions`, streamed or not, greedy or sampled, with
+or without drafts: `choices[0].logprobs.content` lists every generated token (reasoning, tool-call text and the end
+token included) with `token`, `logprob`, `bytes`, its row's `top_logprobs` (best first) and, ours, `token_id` on each
+entry; a stream carries each token's entry on the first chunk sent after it lands. The probabilities are the raw fp32
+logits at temperature 1 over the whole vocabulary (log-sum-exp across the head's vocabulary parts), before temperature,
+top-k, top-p or min-p; the draws are unchanged, so a greedy reply is the same tokens with logprobs on or off. Ours,
+`forced_tokens: [ids]` makes the reply's first tokens these ids instead of draws (teacher forcing); with logprobs each
+is scored under the model's distribution at its row (a thinking budget's forced close may leave a token
+`"unscored": true` with logprob -9999.0). The Responses API still refuses logprobs.
 `ignore_eos: true` keeps user-supplied `stop` strings active, including when a stop string spans streamed chunks.
 Both backends reject a non-boolean `ignore_eos` or a malformed `stop` with HTTP 400 before a stream opens.
 Both backends reject malformed `temperature`, `top_p`, `top_k` and `seed` values with HTTP 400, whether or not

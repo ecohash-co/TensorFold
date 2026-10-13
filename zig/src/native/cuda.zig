@@ -377,7 +377,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     const vision: ?api.Vision = if (@hasField(@TypeOf(loaded), "vision")) loaded.vision else null;
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision }, .{ .ctx = loaded.ctx, .text = F.explain });
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .logprobs = @hasDecl(F, "reports_logprobs") and F.reports_logprobs }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }

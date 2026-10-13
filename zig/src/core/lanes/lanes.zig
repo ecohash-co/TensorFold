@@ -20,6 +20,7 @@ pub const windows = @import("windows.zig");
 pub const trail = @import("trail.zig");
 pub const engine = @import("engine.zig");
 pub const fake = @import("fake.zig");
+pub const logprobs = @import("logprobs.zig");
 
 pub const Engine = engine.Engine;
 pub const Config = config.Config;

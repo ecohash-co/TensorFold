@@ -72,7 +72,8 @@ pub const Fan = struct {
         return f.commMx(rank, world, 0);
     }
 
-    /// comm, with TF_DS_PREFILL_MXFP4_LAYERS' cross-rank check riding on the id's frames (mx_prompt.trailer): `mx` 0
+    /// comm, with TF_DS_PREFILL_MXFP4_LAYERS' cross-rank check riding on the id's frames (mx_prompt.trailer; `mx` is
+    /// mx_prompt.checkWord, so TF_DS_MXFP4_MIN_ROWS is checked with n): `mx` 0
     /// sends and accepts exactly today's frames; otherwise rank 0 appends its n to each id and waits for each
     /// follower's acknowledgement, and a follower whose n differs from rank 0's (0 without a trailer) refuses.
     pub fn commMx(f: *const Fan, rank: u32, world: u32, mx: u32) !Comm {
@@ -93,11 +94,11 @@ pub const Fan = struct {
                     for (f.links, 1..) |l, g| if (l) |x| {
                         var ack: [8]u8 = undefined;
                         const got = x.recv(&ack) catch |err| {
-                            std.log.err("TF_DS_PREFILL_MXFP4_LAYERS={d}: rank {d} did not acknowledge it ({s}): every rank must run the same n", .{ mx, g, @errorName(err) });
+                            std.log.err("MXFP4 check word {d} (n | min_rows << 8): rank {d} did not acknowledge it ({s}): every rank must run the same TF_DS_PREFILL_MXFP4_LAYERS and TF_DS_MXFP4_MIN_ROWS", .{ mx, g, @errorName(err) });
                             return error.MxLayersDisagree;
                         };
                         if (mx_prompt.trailerOf(got, 0) != mx) {
-                            std.log.err("TF_DS_PREFILL_MXFP4_LAYERS={d}: rank {d} answered otherwise: every rank must run the same n", .{ mx, g });
+                            std.log.err("MXFP4 check word {d} (n | min_rows << 8): rank {d} answered otherwise: every rank must run the same TF_DS_PREFILL_MXFP4_LAYERS and TF_DS_MXFP4_MIN_ROWS", .{ mx, g });
                             return error.MxLayersDisagree;
                         }
                     };
@@ -107,7 +108,7 @@ pub const Fan = struct {
                 const got = try f.links[0].?.recv(&buf);
                 const theirs = mx_prompt.trailerOf(got, id_len) orelse return error.BadUniqueId;
                 if (theirs != mx) {
-                    std.log.err("TF_DS_PREFILL_MXFP4_LAYERS: rank 0 runs {d}, this rank {d}: every rank must run the same n", .{ theirs, mx });
+                    std.log.err("MXFP4 check word (n | min_rows << 8): rank 0 runs {d}, this rank {d}: every rank must run the same TF_DS_PREFILL_MXFP4_LAYERS and TF_DS_MXFP4_MIN_ROWS", .{ theirs, mx });
                     return error.MxLayersDisagree;
                 }
                 id = std.mem.bytesToValue(nccl.UniqueId, got[0..id_len]);
@@ -505,8 +506,9 @@ pub const Two = struct {
     /// for this node's output columns: ch.pm [n, dw[p]] fp32. A chunk of fewer than EXACT_ROWS rows takes the decode
     /// window's fused path and scratch (experts2d.fused_ok), as the rounds do.
     pub fn experts(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
-        // TF_DS_PREFILL_MXFP4_LAYERS: this layer's prompt chunks (any row count) on the MXFP4 experts
-        if (t.mx) |mx| if (mx.has(lay.idx)) return t.expertsMx(e, ch, lay, mx);
+        // TF_DS_PREFILL_MXFP4_LAYERS: this layer's prompt chunks on the MXFP4 experts (TF_DS_MXFP4_MIN_ROWS: those of at
+        // least that many rows; ch.n is the same on every rank)
+        if (t.mx) |mx| if (mx.takes(lay.idx, ch.n)) return t.expertsMx(e, ch, lay, mx);
         const c = e.c;
         const n = ch.n;
         if (n < exl3_experts.exact_rows) {

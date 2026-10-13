@@ -133,7 +133,7 @@ pub const Kernels = struct {
 
 // -- the knobs (Model.open) -------------------------------------------------------------------------------------------
 
-pub const start_line = "TF_DS_PREFILL_MXFP4_LAYERS={d}: prompt chunks of layers 0-{d} on the MXFP4 experts ({d:.1} GiB of slices from {s}; tier 2, numerics change)";
+pub const start_line = "TF_DS_PREFILL_MXFP4_LAYERS={d}: prompt chunks of layers 0-{d} on the MXFP4 experts ({d:.1} GiB of slices from {s}; tier 2, numerics change); TF_DS_MXFP4_MIN_ROWS={d}: chunks of fewer rows stay on EXL3";
 
 /// TF_DS_PREFILL_MXFP4_LAYERS's value: null, "" or "0": off (0); 1..max: layers [0, n) (max = the encoder layers, 20);
 /// anything else error.BadPrefillMxfp4.
@@ -148,6 +148,32 @@ pub fn parseLayers(v: ?[]const u8, max: usize) !u32 {
 pub fn layersFromEnv(max: usize) !u32 {
     const v = std.c.getenv("TF_DS_PREFILL_MXFP4_LAYERS") orelse return 0;
     return parseLayers(std.mem.span(v), max);
+}
+
+/// TF_DS_MXFP4_MIN_ROWS=m (default 0: every chunk): a prompt chunk of fewer than m rows keeps the EXL3 experts on the
+/// MXFP4 layers too, so short prompts (chat turns, most quality items, decode benches) stay byte-identical to the build
+/// without MXFP4 while long prompts' full chunks take it. A chunk's row count is the same on every rank (begin() sets
+/// it from the request's ids; the EXL3 path already branches on it at exact_rows), so the choice never splits the ranks.
+/// At most max_min_rows (4096, max_pass_rows); anything else error.BadMxfp4MinRows.
+pub const max_min_rows = 4096;
+
+pub fn parseMinRows(v: ?[]const u8) !u32 {
+    const s = v orelse return 0;
+    if (s.len == 0) return 0;
+    const n = std.fmt.parseInt(u32, s, 10) catch return error.BadMxfp4MinRows;
+    if (n > max_min_rows) return error.BadMxfp4MinRows;
+    return n;
+}
+
+pub fn minRowsFromEnv() !u32 {
+    const v = std.c.getenv("TF_DS_MXFP4_MIN_ROWS") orelse return 0;
+    return parseMinRows(std.mem.span(v));
+}
+
+/// The word the cross-rank check carries (prompt2d.Fan.commMx): n | min_rows << 8 (n <= 20, min_rows <= 4096), 0 off.
+pub fn checkWord(n: u32, min_rows: u32) u32 {
+    if (n == 0) return 0;
+    return n | min_rows << 8;
 }
 
 /// TF_DS_MXFP4_DIR: where the slices are inside the lane's container. Default /cache/mxfp4-slices: the recipe's
@@ -195,10 +221,16 @@ pub const State = struct {
     layers: []const Layer,
     sc: Scratch,
     geos: Geos = .{},
+    min_rows: usize = 0, // TF_DS_MXFP4_MIN_ROWS
 
     /// Whether layer `li`'s prompt chunks take the MXFP4 path.
     pub fn has(st: *const State, li: usize) bool {
         return li < st.layers.len;
+    }
+
+    /// Whether a chunk of `rows` rows takes it on layer `li` (has, and at least min_rows rows).
+    pub fn takes(st: *const State, li: usize, rows: usize) bool {
+        return st.has(li) and rows >= st.min_rows;
     }
 };
 
@@ -949,6 +981,21 @@ test "TF_DS_PREFILL_MXFP4_LAYERS, TF_DS_MXFP4_MIN_AVAIL_GIB and the cross-rank t
     try testing.expectEqual(@as(f64, 2.5), try parseMinAvail("2.5"));
     try testing.expectError(error.BadMxfp4MinAvail, parseMinAvail("-1"));
     try testing.expectError(error.BadMxfp4MinAvail, parseMinAvail("nan"));
+    try testing.expectEqual(@as(u32, 0), try parseMinRows(null));
+    try testing.expectEqual(@as(u32, 0), try parseMinRows(""));
+    try testing.expectEqual(@as(u32, 2048), try parseMinRows("2048"));
+    try testing.expectEqual(@as(u32, 4096), try parseMinRows("4096"));
+    for ([_][]const u8{ "4097", "-1", "x", "2048 " }) |v| try testing.expectError(error.BadMxfp4MinRows, parseMinRows(v));
+    if (std.c.getenv("TF_DS_MXFP4_MIN_ROWS") == null) try testing.expectEqual(@as(u32, 0), try minRowsFromEnv());
+    try testing.expectEqual(@as(u32, 0), checkWord(0, 2048));
+    try testing.expectEqual(@as(u32, 16), checkWord(16, 0));
+    try testing.expectEqual(@as(u32, 16 | 2048 << 8), checkWord(16, 2048));
+    try testing.expect(checkWord(16, 2048) != checkWord(16, 1024));
+    try testing.expect(checkWord(20, 4096) != checkWord(16, 4096));
+    var st: State = .{ .k = undefined, .layers = &[_]Layer{ undefined, undefined }, .sc = undefined, .min_rows = 2048 };
+    try testing.expect(st.takes(1, 2048) and !st.takes(1, 2047) and !st.takes(2, 4096));
+    st.min_rows = 0;
+    try testing.expect(st.takes(0, 1) and !st.takes(2, 1));
     // (the test process's environment does not set them)
     if (std.c.getenv("TF_DS_PREFILL_MXFP4_LAYERS") == null) try testing.expectEqual(@as(u32, 0), try layersFromEnv(20));
     if (std.c.getenv("TF_DS_MXFP4_DIR") == null) try testing.expectEqualStrings(default_dir, dirFromEnv());

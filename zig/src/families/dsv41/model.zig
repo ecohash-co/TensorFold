@@ -404,6 +404,7 @@ pub const Model = struct {
         // slices; the four-node parity split, not the overlapped passes (their second chunk's Two has no MXFP4 state)
         const mx_n = try mx_prompt.layersFromEnv(c.layers / 2);
         const mx_min = try mx_prompt.minAvailFromEnv();
+        const mx_rows = try mx_prompt.minRowsFromEnv(); // TF_DS_MXFP4_MIN_ROWS (0: every chunk, as before)
         if (mx_n != 0) {
             if (sp.pair == null or o.world != 4) return error.MxNeedsTheFourNodeSplit;
             if (!sp.parity) return error.MxNeedsTheParitySplit;
@@ -436,7 +437,7 @@ pub const Model = struct {
         // the ranks' link and NCCL (rank 0 listens: rank 1 retries its connect while rank 0 loads)
         m.fan = try prompt2d.Fan.open(io, o.master, o.port, o.rank, o.world);
         errdefer m.fan.close();
-        m.comm = try m.fan.commMx(o.rank, o.world, mx_n); // (mx_n 0: today's frames)
+        m.comm = try m.fan.commMx(o.rank, o.world, mx_prompt.checkWord(mx_n, mx_rows)); // (mx_n 0: today's frames)
         errdefer m.comm.deinit();
         // overlapped passes: their second NCCL communicator, right after the first on every rank (the unique id goes
         // down the same links in the same order)
@@ -818,9 +819,10 @@ pub const Model = struct {
         const sz = mx_prompt.Scratch.sizes(m.pass_rows, slots, x);
         var ptrs: [12]u64 = undefined;
         for (sz, &ptrs) |n, *pp| pp.* = try m.arena.take(n);
-        m.mx_st = .{ .k = &m.mx_k.?, .layers = m.mx_layers, .sc = mx_prompt.Scratch.of(m.pass_rows, slots, x, ptrs) };
+        const min_rows = mx_prompt.minRowsFromEnv() catch unreachable; // (Model.open parsed it)
+        m.mx_st = .{ .k = &m.mx_k.?, .layers = m.mx_layers, .sc = mx_prompt.Scratch.of(m.pass_rows, slots, x, ptrs), .min_rows = min_rows };
         t.mx = &m.mx_st;
-        std.log.info(mx_prompt.start_line, .{ m.mx_layers.len, m.mx_layers.len - 1, @as(f64, @floatFromInt(bytes)) / (1 << 30), mx_prompt.dirFromEnv() });
+        std.log.info(mx_prompt.start_line, .{ m.mx_layers.len, m.mx_layers.len - 1, @as(f64, @floatFromInt(bytes)) / (1 << 30), mx_prompt.dirFromEnv(), min_rows });
     }
 
     pub fn close(m: *Model) void {

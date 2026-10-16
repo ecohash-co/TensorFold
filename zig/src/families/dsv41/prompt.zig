@@ -1436,7 +1436,8 @@ fn selectRowsPart(e: *const Engine, ch: *Chunk, cs: *const Caches, src: usize, s
         const sel = if (m <= tri.decode_rows) m else z - a;
         const q = ch.iq4 + row * ih * id * 2;
         const wb = ch.iw + row * ih * 2;
-        const vr = ch.vis + row * 8;
+        // vis at a 16-byte-aligned address (visBlock), as selectRows passes it: the rows the scores read
+        const vr = try visBlock(e, ch, row, if (m <= tri.decode_rows) m else @max(sel, 2));
         const out = ch.cidx + row * kk * 8;
         if (m <= tri.decode_rows) {
             try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.keys, null, true, ch.tmax, false, m, ih, id);

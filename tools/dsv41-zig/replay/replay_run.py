@@ -11,7 +11,7 @@ Corpus JSONL, one object per line: {id, messages, bucket, est_tokens, [grader], 
       --corpus corpus.jsonl --out A.jsonl --max-tokens 128 --buckets 8k,32k --limit 10
   python3 replay_run.py compare A.jsonl B.jsonl --baseline A2.jsonl --gate
 
-Thinking is disabled with chat_template_kwargs {enable_thinking: false} (same as a greedy collector; TensorFold also
+Thinking is disabled with chat_template_kwargs {enable_thinking: false} (same as ops/collect_greedy.py; TensorFold also
 hears "thinking").  Logprobs: the request is first tried with logprobs+top_logprobs=20 (+return_token_ids); if the server
 refuses (HTTP 4xx naming logprobs / token ids) the harness drops those fields, remembers the working tier and records
 "logprobs": null.  Refusals are rejected up front, so probing costs no prefill.
@@ -307,9 +307,19 @@ def summarize(rows):
 
 
 def pair(fa, fb):
+    """Every id in either file. An id that one side lacks is an error row in its bucket (counted by the gate's
+    missing-result rule), so a candidate that drops records, or a whole bucket, cannot PASS by omission."""
     A = {r["id"]: r for r in read_jsonl(fa)}
     B = {r["id"]: r for r in read_jsonl(fb)}
-    return [compare_items(A[i], B[i]) for i in A if i in B]
+    rows = []
+    for i in list(A) + [i for i in B if i not in A]:
+        if i in A and i in B:
+            rows.append(compare_items(A[i], B[i]))
+        else:
+            r = A.get(i) or B[i]
+            rows.append({"id": i, "bucket": r.get("bucket"), "error": True, "a_err": i not in A, "b_err": i not in B,
+                         "missing": "A" if i not in A else "B"})
+    return rows
 
 
 def gate(summary, baseline, max_drop, max_kl, max_errors=0):
@@ -334,12 +344,15 @@ def fmt(x, p=3):
 def cmd_compare(a):
     rows = pair(a.a, a.b)
     if not rows:
-        sys.exit("no shared ids between the two files")
+        sys.exit("no ids in either file")
+    if not any(not r["error"] for r in rows) and not a.gate:
+        print("note: no id has a result in both files")
     if a.per_item:
         print(f"{'id':<28}{'bucket':<8}{'same':<6}{'1stchr':<8}{'1sttok':<8}{'edit128':<9}{'top1':<7}{'meanKL':<9}{'maxKL'}")
         for r in rows:
             if r["error"]:
-                print(f"{r['id']:<28}{str(r['bucket']):<8}ERROR (A:{r['a_err']} B:{r['b_err']})"); continue
+                why = f"missing in {r['missing']}" if r.get("missing") else f"A:{r['a_err']} B:{r['b_err']}"
+                print(f"{r['id']:<28}{str(r['bucket']):<8}ERROR ({why})"); continue
             print(f"{r['id']:<28}{str(r['bucket']):<8}{str(r['identical']):<6}{str(r['first_char']):<8}{str(r['first_tok']):<8}"
                   f"{fmt(r['edit128']):<9}{fmt(r['top1']):<7}{fmt(r['mean_kl'],5):<9}{fmt(r['max_kl'],4)}")
         print()
@@ -375,7 +388,7 @@ def main():
                    "max_tokens=len) so both builds score the SAME continuation; items without ids are skipped")
     r.set_defaults(fn=cmd_run)
     c = sp.add_parser("compare", help="compare two run files",
-                      description="Per-bucket comparison of A vs B (ids present in both).\n\n"
+                      description="Per-bucket comparison of A vs B (every id in either file; one missing on a side is an error).\n\n"
                       "Default gate rule (--gate): FAIL (exit 1) if, for any bucket,\n"
                       "  (1) identical-rate(A,B) < baseline identical-rate - 0.05   (baseline = A vs --baseline A2 run;\n"
                       "      without --baseline the baseline is assumed to be 1.0, i.e. fully deterministic),\n"
